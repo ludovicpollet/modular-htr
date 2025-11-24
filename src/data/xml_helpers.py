@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import datasets
 import numpy as np
 import PIL.Image
 from lxml import etree
@@ -70,36 +69,3 @@ def stream_examples_from_xml(xml_root, img_root, convert_L=True):
                 yield {"id": line_id, "image": line_img, "text": line["text"]}
 
 
-def build_hf_dataset(xml_root, img_root, out_dir):
-    features = datasets.Features(
-        {
-            "id": datasets.Value("string"),
-            "image": datasets.Image(),
-            "text": datasets.Value("string"),
-        }
-    )
-    ds = datasets.Dataset.from_generator(
-        lambda: stream_examples_from_xml(
-            xml_root, img_root
-        ),  # wrap in lambda to use parameters
-        features=features,
-    )
-    ds = ds.train_test_split(test_size=0.1, seed=42)
-    ds.save_to_disk(out_dir)
-    return ds
-
-
-def get_charset(ds):
-    pass
-
-
-def CTC_tokenizer(text):
-    pass
-
-
-def basic_image_transforms(image):
-    pass
-
-
-def ctc_collate(batch):
-    pass
