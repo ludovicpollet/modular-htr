@@ -1,8 +1,8 @@
 import collections
 from dataclasses import dataclass
-import datasets
 from typing import Any
 
+import datasets
 
 type Alphabet = list[str]
 type Index = dict[str, int]
@@ -22,8 +22,7 @@ class CharTokenizer:
         return "".join(
             self.alphabet[i]
             for i in ids
-            if 0 <= i < len(self.alphabet)
-            and i not in (self.blank_index, self.pad_index)
+            if 0 <= i < len(self.alphabet) and i != self.blank_index
         )
 
     def __len__(self) -> int:
@@ -35,7 +34,6 @@ def build_char_tokenizer(
     text_col: str = "text",
     splits: str = "all",
     blank_token: str = "<blank>",
-    pad_token: str = "<pad>",
 ) -> CharTokenizer:
     if isinstance(ds, datasets.DatasetDict):
         if splits == "train":
@@ -53,11 +51,11 @@ def build_char_tokenizer(
             counter.update(ex[text_col])
     charset = sorted(counter.keys())
 
-    alphabet: Alphabet = [blank_token, pad_token] + charset
+    alphabet: Alphabet = [blank_token] + charset
     index: Index = {ch: i for i, ch in enumerate(alphabet)}
 
     blank_index = index[blank_token]
-    pad_index = index[pad_token]
+    pad_index = blank_index
 
     return CharTokenizer(
         alphabet=alphabet,
