@@ -8,7 +8,7 @@ from .tokenization import CharTokenizer
 from .transforms import make_basic_image_transform
 
 
-def ctc_collate(batch, pad_index):
+def ctc_collate(batch):
     if not batch:
         raise ValueError("Empty batch passed to collate")
 
@@ -21,26 +21,33 @@ def ctc_collate(batch, pad_index):
     B = len(batch)
     C, H = images[0].shape[0], images[0].shape[1]
     max_W = max(img.shape[-1] for img in images)
-    max_T = max(len(lab) for lab in labels_raw)
 
     images_padded = images[0].new_zeros((B, C, H, max_W))
     for i, img in enumerate(images):
         W_i = img.shape[-1]
         images_padded[i, :, :, :W_i] = img
 
-    labels_padded = torch.full((B, max_T), pad_index, dtype=torch.long)
-    label_lengths = []
-    for i, lab in enumerate(labels_raw):
+    target_lengths = []
+    pieces = []
+    for lab in labels_raw:
         lab_tensor = torch.as_tensor(lab, dtype=torch.long)
         T_i = lab_tensor.shape[0]
-        labels_padded[i, :T_i] = lab_tensor
-        label_lengths.append(T_i)
+        target_lengths.append(T_i)
+        if lab_tensor.numel() > 0:
+            pieces.append(lab_tensor)
+    if pieces:
+        targets = torch.cat(pieces, dim=0)
+    else:
+        targets = torch.empty((0,), dtype=torch.long)
+
+    target_lengths = torch.as_tensor(target_lengths, dtype=torch.long)
+    widths_tensor = torch.as_tensor(widths, dtype=torch.long)
 
     batch_out = {
         "images": images_padded,  # [B, 1, H, W_max]
-        "labels": labels_padded,  # [B, T_max]
-        "label_lengths": torch.as_tensor(label_lengths, dtype=torch.long),
-        "widths": torch.as_tensor(widths, dtype=torch.long),
+        "targets": targets,  # [sum(target_lengths)]
+        "target_lengths": target_lengths,
+        "widths": widths_tensor,
         "ids": [b.get("id") for b in batch],
         "texts": [b.get("text", "") for b in batch],
     }
@@ -108,7 +115,7 @@ def make_dataloaders(
         train_loader = torch.utils.data.DataLoader(
             ds["train"],
             batch_sampler=train_batch_sampler,
-            collate_fn=lambda b: ctc_collate(b, pad_index=tokenizer.pad_index),
+            collate_fn=ctc_collate,
             num_workers=num_workers,
         )
     else:
@@ -116,7 +123,7 @@ def make_dataloaders(
             ds["train"],
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=lambda b: ctc_collate(b, pad_index=tokenizer.pad_index),
+            collate_fn=ctc_collate,
             num_workers=num_workers,
         )
 
@@ -124,7 +131,7 @@ def make_dataloaders(
         ds["test"],
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=lambda b: ctc_collate(b, pad_index=tokenizer.pad_index),
+        collate_fn=ctc_collate,
         num_workers=num_workers,
     )
     return train_loader, test_loader
