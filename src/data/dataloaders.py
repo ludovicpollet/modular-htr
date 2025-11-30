@@ -102,8 +102,18 @@ def make_dataloaders(
     if "train" not in ds or "test" not in ds:
         raise KeyError("DatasetDict must contain at least 'train' and 'test' splits.")
 
-    image_transform = make_basic_image_transform(fixed_height=fixed_height)
-    ds = ds.with_transform(image_transform)
+    train_transform = make_basic_image_transform(
+        fixed_height=fixed_height, augment=True
+    )
+    test_transform = make_basic_image_transform(
+        fixed_height=fixed_height, augment=False
+    )
+    ds = datasets.DatasetDict(
+        {
+            "train": ds["train"].with_transform(train_transform),
+            "test": ds["test"].with_transform(test_transform),
+        }
+    )
 
     if use_bucketing:
         widths_train = [ex["width"] for ex in ds["train"]]
