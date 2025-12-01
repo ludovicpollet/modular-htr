@@ -7,7 +7,14 @@ from src.data.tokenization import apply_ctc_tokenizer, build_char_tokenizer
 from src.model.CRNN import CRNN
 from src.training.ctc import CTCLossWrapper
 from src.training.loop import fit
-from src.training.utils import configure_torch, get_device, set_all_seeds, to_device
+from src.training.utils import (
+    CheckpointManager,
+    configure_torch,
+    create_run_dir,
+    get_device,
+    set_all_seeds,
+    to_device,
+)
 
 
 def main():
@@ -79,7 +86,18 @@ def main():
     assert targets.numel() == int(target_lengths.sum())
     assert model.output_lengths(widths).max() <= T
 
-    fit(
+    run_dir = create_run_dir(base_dir="runs", run_name="test-checkpointing")
+
+    print(f"Run directory: {run_dir}")
+
+    checkpoint_manager = CheckpointManager(
+        save_dir=run_dir,
+        monitor="cer",
+        mode="min",
+        top_k=3,
+    )
+
+    model, _metrics_history = fit(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -91,7 +109,8 @@ def main():
         epochs=epochs,
         tokenizer=tokenizer,
         print_samples=3,
-        full_eval_interval=5,
+        full_eval_interval=1,
+        checkpoint_manager=checkpoint_manager,
     )
 
 
