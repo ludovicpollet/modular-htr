@@ -8,6 +8,8 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+from src.data.tokenization import CharTokenizer
+
 
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -87,6 +89,7 @@ class CheckpointManager:
     mode: Literal["min", "max"] = "min"
     top_k: int = 3
     best_checkpoints: list[CheckpointInfo] = field(default_factory=list)
+    tokenizer: CharTokenizer | None = None
 
     def __post_init__(self):
         if isinstance(self.save_dir, str):
@@ -106,7 +109,7 @@ class CheckpointManager:
         val_metrics,
         config,
     ) -> dict[str, Any]:
-        return {
+        state = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -115,6 +118,9 @@ class CheckpointManager:
             "metrics": dict(val_metrics),
             "config": config,
         }
+        if self.tokenizer is not None:
+            state["tokenizer"] = self.tokenizer.to_dict()
+        return state
 
     def maybe_save(
         self, epoch, model, optimizer, scheduler, scaler, val_metrics, config

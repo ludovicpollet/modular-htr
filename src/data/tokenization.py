@@ -28,6 +28,34 @@ class CharTokenizer:
     def __len__(self) -> int:
         return len(self.alphabet)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "alphabet": self.alphabet,
+            "blank_index": self.blank_index,
+            "pad_index": self.pad_index,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CharTokenizer":
+        alphabet_raw = data["alphabet"]
+        blank_index_raw = data["blank_index"]
+        pad_index_raw = data.get("pad_index", blank_index_raw)
+
+        alphabet: Alphabet = list(alphabet_raw)
+        index: Index = {ch: i for i, ch in enumerate(alphabet)}
+        blank_index = int(blank_index_raw)
+        pad_index = int(pad_index_raw)
+        if not (0 <= blank_index <= len(alphabet)):
+            raise ValueError("Invalid blank index")
+        if not (0 <= pad_index <= len(alphabet)):
+            raise ValueError("Invalid pad index")
+        if not blank_index == 0:
+            print("Warning: blank index needs to be 0 for CTC decoding")
+
+        return cls(
+            alphabet=alphabet, index=index, blank_index=blank_index, pad_index=pad_index
+        )
+
 
 def build_char_tokenizer(
     ds: datasets.Dataset | datasets.DatasetDict,
