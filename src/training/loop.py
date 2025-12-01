@@ -194,7 +194,6 @@ def fit(
                 scheduler=scheduler,
                 scaler=scaler,
                 val_metrics=val_metrics,
-                config=None,  # not defined yet
             )
             checkpoint_manager.save_last(
                 epoch=epoch,
@@ -203,13 +202,13 @@ def fit(
                 scheduler=scheduler,
                 scaler=scaler,
                 val_metrics=val_metrics,
-                config=None,
             )
-            history_record: dict[str, Any] = {"epoch": epoch}
-            for k, v in train_metrics.items():
-                history_record[f"train_{k}"] = float(v)
-            for k, v in val_metrics.items():
-                history_record[f"val_{k}"] = float(v)
-            metrics_history.append(history_record)
+
+        history_record: dict[str, Any] = {"epoch": epoch}
+        for k, v in train_metrics.items():
+            history_record[f"train_{k}"] = float(v)
+        for k, v in val_metrics.items():
+            history_record[f"val_{k}"] = float(v)
+        metrics_history.append(history_record)
 
     return model, metrics_history

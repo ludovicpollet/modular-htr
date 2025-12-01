@@ -89,6 +89,7 @@ class CheckpointManager:
     mode: Literal["min", "max"] = "min"
     top_k: int = 3
     best_checkpoints: list[CheckpointInfo] = field(default_factory=list)
+    config: dict[str, Any] | None = None
     tokenizer: CharTokenizer | None = None
 
     def __post_init__(self):
@@ -107,7 +108,6 @@ class CheckpointManager:
         scheduler,
         scaler,
         val_metrics,
-        config,
     ) -> dict[str, Any]:
         state = {
             "epoch": epoch,
@@ -116,14 +116,14 @@ class CheckpointManager:
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
             "scaler_state_dict": scaler.state_dict() if scaler else None,
             "metrics": dict(val_metrics),
-            "config": config,
+            "config": self.config,
         }
         if self.tokenizer is not None:
             state["tokenizer"] = self.tokenizer.to_dict()
         return state
 
     def maybe_save(
-        self, epoch, model, optimizer, scheduler, scaler, val_metrics, config
+        self, epoch, model, optimizer, scheduler, scaler, val_metrics
     ) -> pathlib.Path | None:
         """Save checkpoint if epoch in top_k, return a path only if checkpoint saved"""
         if self.monitor not in val_metrics:
@@ -147,7 +147,7 @@ class CheckpointManager:
             f"best_{epoch:03d}_{self.monitor}_{score:.4f}.pt"
         )
         state = self._build_state(
-            epoch, model, optimizer, scheduler, scaler, val_metrics, config
+            epoch, model, optimizer, scheduler, scaler, val_metrics
         )
         torch.save(state, path)
 
@@ -162,12 +162,12 @@ class CheckpointManager:
         return path
 
     def save_last(
-        self, epoch, model, optimizer, scheduler, scaler, val_metrics, config
+        self, epoch, model, optimizer, scheduler, scaler, val_metrics
     ) -> pathlib.Path:
         """Save last.pt checkpoint anyway"""
         path = self.save_dir / pathlib.Path("last.pt")
         state = self._build_state(
-            epoch, model, optimizer, scheduler, scaler, val_metrics, config
+            epoch, model, optimizer, scheduler, scaler, val_metrics
         )
         torch.save(state, path)
         return path

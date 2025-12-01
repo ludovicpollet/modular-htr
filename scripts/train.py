@@ -11,9 +11,9 @@ from src.training.utils import (
     CheckpointManager,
     configure_torch,
     create_run_dir,
+    dump_config,
     get_device,
     set_all_seeds,
-    to_device,
 )
 
 
@@ -30,17 +30,27 @@ def main():
 
     ds = apply_ctc_tokenizer(ds, tokenizer, text_col="text")
 
+    dataset_name = "dg31"
+
+    fixed_height = 128
+    batch_size = 32
+
     train_loader, val_loader = make_dataloaders(
         ds,
         tokenizer=tokenizer,
-        fixed_height=128,
-        batch_size=32,
+        fixed_height=fixed_height,
+        batch_size=batch_size,
         num_workers=8,
         use_bucketing=True,
     )
-    num_classes = len(tokenizer)
 
-    model = CRNN(img_channels=1, num_classes=num_classes, rnn_layers=2)
+    num_classes = len(tokenizer)
+    img_channels = 1
+    rnn_layers = 2
+
+    model = CRNN(
+        img_channels=img_channels, num_classes=num_classes, rnn_layers=rnn_layers
+    )
     model.to(device)
 
     use_compile = device.type == "cuda"
@@ -51,50 +61,46 @@ def main():
 
     loss_fn = CTCLossWrapper(blank=tokenizer.blank_index)
     epochs = 150
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    lr = 3e-4
+    weight_decay = 1e-5
+    eta_min = 3e-5
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=3e-5
+        optimizer, T_max=epochs, eta_min=eta_min
     )
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
-    batch = next(iter(train_loader))
-    batch = to_device(batch, device)
-
-    images = batch["images"]
-    widths = batch["widths"]
-    targets = batch["targets"]
-    target_lengths = batch["target_lengths"]
-
-    with torch.inference_mode():
-        logits = model(images)
-
-    T, B, C = logits.shape
-
-    print(
-        "Sanity shapes:",
-        "images",
-        images.shape,
-        "logits",
-        logits.shape,
-        "time_reduction",
-        model.time_reduction,
-        "computed_input_lengths",
-        model.output_lengths(widths),
-    )
-
-    assert B == images.size(0)
-    assert targets.numel() == int(target_lengths.sum())
-    assert model.output_lengths(widths).max() <= T
+    run_config = {
+        "dataset_name": dataset_name,
+        "train_samples": len(ds["train"]),
+        "val_samples": len(ds["test"]),
+        "fixed_height": fixed_height,
+        "batch_size": batch_size,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "eta_min": eta_min,
+        "epochs": epochs,
+        "model": {
+            "img_channels": img_channels,
+            "num_classes": num_classes,
+            "rnn_layers": rnn_layers,
+            "time_reduction": model.time_reduction,
+        },
+    }
 
     run_dir = create_run_dir(base_dir="runs", run_name="test-checkpointing")
-
     print(f"Run directory: {run_dir}")
+
+    # for convenience (it goes in checkpoint anyway)
+    dump_config(run_dir, run_config)
 
     checkpoint_manager = CheckpointManager(
         save_dir=run_dir,
         monitor="cer",
         mode="min",
         top_k=3,
+        tokenizer=tokenizer,
+        config=run_config,
     )
 
     model, _metrics_history = fit(
