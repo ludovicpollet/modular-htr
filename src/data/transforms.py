@@ -9,7 +9,7 @@ def resize_keep_aspect(pil_img: PIL.Image.Image, fixed_height: int) -> PIL.Image
     w, h = pil_img.size
     new_h = fixed_height
     new_w = int(round(w * new_h / h))
-    return pil_img.resize((new_w, new_h), resample=PIL.Image.BILINEAR)
+    return pil_img.resize((new_w, new_h), resample=PIL.Image.Resampling.HAMMING)
 
 
 def make_basic_image_transform(fixed_height: int, augment: bool = False) -> Callable:
