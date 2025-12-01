@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
@@ -6,7 +8,7 @@ from src.data.tokenization import CharTokenizer
 
 from .ctc import greedy_ctc_decode
 from .metrics import cer, wer
-from .utils import format_metrics, to_device
+from .utils import CheckpointManager, format_metrics, to_device
 
 
 def train_one_epoch(
@@ -154,7 +156,11 @@ def fit(
     print_samples=3,
     max_batches=None,
     full_eval_interval: int = 5,
-):
+    checkpoint_manager: CheckpointManager | None = None,
+    metrics_history: list[dict] | None = None,
+) -> tuple[torch.nn.Module, list[dict]]:
+    if metrics_history is None:
+        metrics_history = []
     for epoch in range(1, epochs + 1):
         train_metrics = train_one_epoch(
             model=model,
@@ -179,4 +185,31 @@ def fit(
             max_batches=max_batches,
         )
         log_fn(format_metrics(epoch, train_metrics, val_metrics, optimizer))
-    return model
+
+        if checkpoint_manager is not None:
+            checkpoint_manager.maybe_save(
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                val_metrics=val_metrics,
+                config=None,  # not defined yet
+            )
+            checkpoint_manager.save_last(
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                val_metrics=val_metrics,
+                config=None,
+            )
+            history_record: dict[str, Any] = {"epoch": epoch}
+            for k, v in train_metrics.items():
+                history_record[f"train_{k}"] = float(v)
+            for k, v in val_metrics.items():
+                history_record[f"val_{k}"] = float(v)
+            metrics_history.append(history_record)
+
+    return model, metrics_history
