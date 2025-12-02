@@ -1,10 +1,10 @@
 import math
 import random
+import os
 
 import datasets
 import torch
 
-from .tokenization import CharTokenizer
 from .transforms import make_basic_image_transform
 
 
@@ -16,7 +16,7 @@ def ctc_collate(batch):
 
     images = [b["image"] for b in batch]
     labels_raw = [b["labels"] for b in batch]
-    widths = [b["width"] for b in batch]
+    widths = [img.shape[-1] for img in images]
 
     B = len(batch)
     C, H = images[0].shape[0], images[0].shape[1]
@@ -86,13 +86,56 @@ class BucketByWidthSampler(torch.utils.data.Sampler):
         return math.ceil(len(self.indices) / self.batch_size)
 
 
+def _compute_resized_width(batch, fixed_height):
+    widths = []
+    for img in batch["image"]:
+        w, h = img.size
+        widths.append(int(round(w * fixed_height / h)))
+    return {"width": widths}
+
+
+def _ensure_widths(ds, fixed_height, num_proc=None):
+    if "width" in ds["train"].column_names and "width" in ds["test"].column_names:
+        return ds
+    num_proc = num_proc or min(os.cpu_count() or 1, 16)
+    return datasets.DatasetDict(
+        {
+            "train": ds["train"].map(
+                _compute_resized_width,
+                fn_kwargs={"fixed_height": fixed_height},
+                batched=True,
+                batch_size=1024,
+                num_proc=num_proc,
+            ),
+            "test": ds["test"].map(
+                _compute_resized_width,
+                fn_kwargs={"fixed_height": fixed_height},
+                batched=True,
+                batch_size=1024,
+                num_proc=num_proc,
+            ),
+        }
+    )
+
+
+def _bucket_widths(widths, bin_size: int | None):
+    """
+    Helper to round up bucketing widths to nearest bin_size multiple.
+    Used to reduce number of unique widths when using cuDNN benchmarking.
+    """
+    if not bin_size:
+        return list(widths)
+    return [math.ceil(w / bin_size) * bin_size for w in widths]
+
+
 def make_dataloaders(
     ds: datasets.DatasetDict,
-    tokenizer: CharTokenizer,
-    fixed_height: int = 128,
+    fixed_height: int = 96,
     batch_size: int = 32,
-    num_workers: int = 4,
+    num_workers: int = 16,
     use_bucketing: bool = True,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """High level convenience to build DataLoaders from a HF DatasetDict"""
     if not isinstance(ds, datasets.DatasetDict):
@@ -101,6 +144,10 @@ def make_dataloaders(
         )
     if "train" not in ds or "test" not in ds:
         raise KeyError("DatasetDict must contain at least 'train' and 'test' splits.")
+
+    ds = _ensure_widths(ds, fixed_height=fixed_height, num_proc=num_workers)
+    bucket_bin = 16 if torch.backends.cudnn.benchmark else None
+    widths_train = _bucket_widths(ds["train"]["width"], bin_size=bucket_bin)
 
     train_transform = make_basic_image_transform(
         fixed_height=fixed_height, augment=True
@@ -115,8 +162,18 @@ def make_dataloaders(
         }
     )
 
+    persistent_workers = num_workers > 0
+
+    loader_kwargs = dict(
+        collate_fn=ctc_collate,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
+    )
+    if persistent_workers and prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
     if use_bucketing:
-        widths_train = [ex["width"] for ex in ds["train"]]
         train_batch_sampler = BucketByWidthSampler(
             widths=widths_train,
             batch_size=batch_size,
@@ -125,23 +182,20 @@ def make_dataloaders(
         train_loader = torch.utils.data.DataLoader(
             ds["train"],
             batch_sampler=train_batch_sampler,
-            collate_fn=ctc_collate,
-            num_workers=num_workers,
+            **loader_kwargs,
         )
     else:
         train_loader = torch.utils.data.DataLoader(
             ds["train"],
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=ctc_collate,
-            num_workers=num_workers,
+            **loader_kwargs,
         )
 
     test_loader = torch.utils.data.DataLoader(
         ds["test"],
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=ctc_collate,
-        num_workers=num_workers,
+        **loader_kwargs,
     )
     return train_loader, test_loader
