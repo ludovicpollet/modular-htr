@@ -57,11 +57,16 @@ class CharTokenizer:
         )
 
 
+def _count_batch(batch, text_col):
+    return {"chars": ["".join(batch[text_col])]}
+
+
 def build_char_tokenizer(
     ds: datasets.Dataset | datasets.DatasetDict,
     text_col: str = "text",
     splits: str = "all",
     blank_token: str = "<blank>",
+    num_proc: int = 16,
 ) -> CharTokenizer:
     if isinstance(ds, datasets.DatasetDict):
         if splits == "train":
@@ -75,8 +80,16 @@ def build_char_tokenizer(
 
     counter: collections.Counter[str] = collections.Counter()
     for split_ds in iterables:
-        for ex in split_ds:
-            counter.update(ex[text_col])
+        tmp = split_ds.map(
+            _count_batch,
+            fn_kwargs={"text_col": text_col},
+            batched=True,
+            batch_size=1000,
+            num_proc=num_proc,
+            remove_columns=split_ds.column_names,
+        )
+        for s in tmp["chars"]:
+            counter.update(s)
     charset = sorted(counter.keys())
 
     alphabet: Alphabet = [blank_token] + charset
