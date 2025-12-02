@@ -3,10 +3,11 @@ import json
 import pathlib
 import random
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from src.data.tokenization import CharTokenizer
 
@@ -41,6 +42,12 @@ def set_all_seeds(seed=42) -> None:
 
 def configure_torch() -> None:
     torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+
+def make_log_fn(use_pbar: bool = True) -> Callable[[str], None]:
+    return tqdm.write if use_pbar else print
 
 
 def format_metrics(epoch, train_metrics, val_metrics, optimizer):

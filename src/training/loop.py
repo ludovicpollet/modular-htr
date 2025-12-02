@@ -1,14 +1,15 @@
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from src.data.tokenization import CharTokenizer
 
 from .ctc import greedy_ctc_decode
 from .metrics import cer, wer
-from .utils import CheckpointManager, format_metrics, to_device
+from .utils import CheckpointManager, format_metrics, make_log_fn, to_device
 
 
 def train_one_epoch(
@@ -21,6 +22,7 @@ def train_one_epoch(
     scheduler=None,
     grad_clip_norm: float | None = 1.0,
     accum_steps: int = 1,
+    use_pbar: bool = True,
 ):
     model.train()
     running_loss = 0.0
@@ -31,7 +33,9 @@ def train_one_epoch(
 
     optimizer.zero_grad(set_to_none=True)
 
-    for step, batch in enumerate(dataloader):
+    iterator = tqdm(dataloader, desc="Train", leave=False) if use_pbar else dataloader
+
+    for step, batch in enumerate(iterator):
         batch = to_device(batch, device)
 
         images = batch["images"]
@@ -91,16 +95,23 @@ def evaluate(
     compute_metrics: bool = False,
     print_samples: int = 0,
     max_batches: int | None = None,
+    use_pbar: bool = True,
+    log_fn: Callable | None = None,
 ):
     model.eval()
     total_loss = 0.0
     total_batches = 0
 
+    if log_fn is None:
+        log_fn = make_log_fn(use_pbar)
+
+    iterator = tqdm(dataloader, desc="Eval", leave=False) if use_pbar else dataloader
+
     refs = []
     hyps = []
 
     with torch.inference_mode():
-        for batch_id, batch in enumerate(dataloader):
+        for batch_id, batch in enumerate(iterator):
             if max_batches is not None and batch_id >= max_batches:
                 break
             batch = to_device(batch, device)
@@ -127,7 +138,7 @@ def evaluate(
 
                 if print_samples > 0 and batch_id == 0:
                     for i in range(min(print_samples, len(decoded))):
-                        print(
+                        log_fn(
                             f"[val sample {i}] pred: {decoded[i]!r} | gt: {texts[i]!r}"
                         )
 
@@ -151,17 +162,25 @@ def fit(
     epochs: int = 40,
     grad_clip_norm: float | None = 1.0,
     accum_steps: int = 1,
-    log_fn=print,
+    log_fn: Callable[[str], None] | None = None,
     tokenizer=None,
     print_samples=3,
     max_batches=None,
     full_eval_interval: int = 5,
     checkpoint_manager: CheckpointManager | None = None,
     metrics_history: list[dict] | None = None,
+    use_pbar=True,
 ) -> tuple[torch.nn.Module, list[dict]]:
     if metrics_history is None:
         metrics_history = []
-    for epoch in range(1, epochs + 1):
+
+    log = log_fn or make_log_fn(use_pbar)
+
+    epoch_iter = (
+        tqdm(range(1, epochs + 1), desc="Epochs") if use_pbar else range(1, epochs + 1)
+    )
+
+    for epoch in epoch_iter:
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -172,6 +191,7 @@ def fit(
             scheduler=scheduler,
             grad_clip_norm=grad_clip_norm,
             accum_steps=accum_steps,
+            use_pbar=use_pbar,
         )
         compute_metrics = epoch % full_eval_interval == 0
         val_metrics = evaluate(
@@ -183,8 +203,10 @@ def fit(
             compute_metrics=compute_metrics,
             print_samples=print_samples,
             max_batches=max_batches,
+            use_pbar=use_pbar,
+            log_fn=log,
         )
-        log_fn(format_metrics(epoch, train_metrics, val_metrics, optimizer))
+        log(format_metrics(epoch, train_metrics, val_metrics, optimizer))
 
         if checkpoint_manager is not None:
             checkpoint_manager.maybe_save(
