@@ -11,38 +11,70 @@ def conv_block(in_ch, out_ch, kernel_size=3, stride=1, padding=1):
 
 
 class CRNN(nn.Module):
-    def __init__(self, img_channels, num_classes, rnn_layers=2):
+    def __init__(
+        self,
+        img_channels: int,
+        num_classes: int,
+        rnn_layers: int = 2,
+        conv_channels: list[int] | None = None,
+        pool_kernels: list[tuple[int, int]] | None = None,
+        rnn_hidden: int = 256,
+        dropout: float = 0.2,
+    ):
+        """
+        Minimal Pylaia-style CRNN model with configurable layers.
+        """
         super().__init__()
-        self.time_reduction = 4
 
-        self.cnn = nn.Sequential(
-            # Input: (B, 1, H, W)
-            conv_block(img_channels, 64),
-            nn.MaxPool2d(kernel_size=(2, 2)),  # (H/2, W/2)
-            conv_block(64, 128),
-            nn.MaxPool2d(kernel_size=(2, 2)),  # (H/4, W/4)
-            conv_block(128, 256),
-            nn.MaxPool2d(kernel_size=(2, 1)),  # (H/8, W/4)
-            conv_block(256, 256),
-            nn.MaxPool2d(kernel_size=(2, 1)),  # (H/16, W/4)
-            conv_block(256, 512),
-            # Collapse height to 1
-            nn.AdaptiveAvgPool2d((1, None)),  # (1, W/4)
-        )
-        cnn_out_channels = 512
-        self.feature_size = cnn_out_channels
+        # store config for checkpointing
+        self.img_channels = img_channels
+        self.num_classes = num_classes
+        self.rnn_layers = rnn_layers
+        self.rnn_hidden = rnn_hidden
+        self.dropout_prob = dropout
+
+        conv_channels = conv_channels or [64, 128, 256, 256, 512]
+        pool_kernels = pool_kernels or [(2, 2), (2, 2), (2, 1), (2, 1)]
+        self.conv_channels = list(conv_channels)
+        self.pool_kernels = [tuple(k) for k in pool_kernels]
+
+        layers: list[nn.Module] = []
+        stages = []
+        in_ch = self.img_channels
+        time_reduction = 1
+
+        for i, out_ch in enumerate(self.conv_channels):
+            layers.append(conv_block(in_ch, out_ch))
+            if i < len(self.pool_kernels):
+                k_h, k_w = self.pool_kernels[i]
+                layers.append(nn.MaxPool2d(kernel_size=(k_h, k_w)))
+                stages.append(nn.Sequential(*layers)) # conv + pool grouped as a stage for (un)freezing
+                layers = []
+                time_reduction *= k_w
+            in_ch = out_ch
+        if layers: # leftover conv without pool
+            stages.append(nn.Sequential(*layers))
+       
+        # Collapse height to 1, keep time dimension
+        # This is its own stage
+        stages.append(nn.AdaptiveAvgPool2d((1, None)))
+
+        self.cnn_stages = nn.ModuleList(stages)
+        self.cnn = nn.Sequential(*stages)
+        self.feature_size = self.conv_channels[-1]
+        self.time_reduction = time_reduction
 
         self.rnn = nn.LSTM(
             input_size=self.feature_size,
-            hidden_size=256,
-            num_layers=rnn_layers,
+            hidden_size=self.rnn_hidden,
+            num_layers=self.rnn_layers,
             bidirectional=True,
             batch_first=False,
         )
-        self.dropout = nn.Dropout(0.2)
+        self.dropout_layer = nn.Dropout(self.dropout_prob)
 
-        # Linear projection to classes for CTC (needs 2*256 because bidirectionial)
-        self.fc = nn.Linear(2 * 256, num_classes)
+        # Linear projection to classes for CTC (needs 2*rnn_hidden because bidirectional)
+        self.fc = nn.Linear(2 * self.rnn_hidden, self.num_classes)
 
     def output_lengths(self, widths: torch.Tensor) -> torch.Tensor:
         """Map image widths (post preprocessing, in pixels) to sequence lengths (T) for CTC"""
@@ -57,7 +89,19 @@ class CRNN(nn.Module):
         features = features.permute(2, 0, 1)
 
         rnn_out, _ = self.rnn(features)
-        rnn_out = self.dropout(rnn_out)
+        rnn_out = self.dropout_layer(rnn_out)
 
         logits = self.fc(rnn_out)
         return logits
+    
+    def to_config(self) -> dict:
+        return {
+            "img_channels": self.img_channels,
+            "num_classes": self.num_classes,
+            "rnn_layers": self.rnn_layers,
+            "conv_channels": self.conv_channels,
+            "pool_kernels": self.pool_kernels,
+            "rnn_hidden": self.rnn_hidden,
+            "dropout": self.dropout_prob,
+            "time_reduction": self.time_reduction,
+        }
