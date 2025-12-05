@@ -170,6 +170,7 @@ def fit(
     checkpoint_manager: CheckpointManager | None = None,
     metrics_history: list[dict] | None = None,
     use_pbar=True,
+    on_epoch_start: Callable | None = None,
 ) -> tuple[torch.nn.Module, list[dict]]:
     if metrics_history is None:
         metrics_history = []
@@ -181,6 +182,9 @@ def fit(
     )
 
     for epoch in epoch_iter:
+        if on_epoch_start: 
+            on_epoch_start(epoch, model)
+
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
