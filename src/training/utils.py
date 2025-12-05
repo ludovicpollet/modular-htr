@@ -40,10 +40,12 @@ def set_all_seeds(seed=42) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def configure_torch() -> None:
+def configure_torch(benchmark: bool = True) -> None:
     torch.set_float32_matmul_precision("high")
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = benchmark
     torch.backends.cudnn.deterministic = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def make_log_fn(use_pbar: bool = True) -> Callable[[str], None]:
@@ -75,6 +77,26 @@ def create_run_dir(
     run_dir.mkdir(exist_ok=False)
 
     return run_dir
+
+def serialize_optimizer_config(optimizer) -> dict[str, Any]:
+    """
+    Serialize the live optimizer configuration.
+    This is only for the human readable run config dump and is not used to restore states.
+    """
+    opt_config = {
+        "name": optimizer.__class__.__name__,
+        "param_groups": [
+            {
+                "lr": pg.get("lr", optimizer.defaults.get("lr")),
+                "weight_decay": pg.get("weight_decay", optimizer.defaults.get("weight_decay")),
+                "betas": list(pg.get("betas", optimizer.defaults.get("betas", (None, None)))),
+                "eps": pg.get("eps", optimizer.defaults.get("eps")),
+                "fused": pg.get("fused", optimizer.defaults.get("fused")),
+            }
+            for pg in optimizer.param_groups
+        ],
+    }
+    return opt_config
 
 
 def dump_config(run_dir: pathlib.Path, run_config: dict) -> None:
