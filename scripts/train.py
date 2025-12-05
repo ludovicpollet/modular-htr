@@ -1,3 +1,4 @@
+import math
 import torch
 from datasets import load_from_disk
 from torch import optim
@@ -12,6 +13,7 @@ from src.training.utils import (
     CheckpointManager,
     configure_torch,
     create_run_dir,
+    serialize_optimizer_config,
     dump_config,
     get_device,
     set_all_seeds,
@@ -20,7 +22,7 @@ from src.training.utils import (
 
 def main():
     set_all_seeds(42)
-    configure_torch()
+    configure_torch(benchmark=False)
 
     device = get_device()
     print(f"Using device: {device}")
@@ -43,9 +45,9 @@ def main():
 
     dataset_name = "HOME-alcar"
 
-    fixed_height = 64
-    batch_size = 32
-    accum_steps = 1
+    fixed_height = 96
+    batch_size = 16
+    accum_steps = 2
 
     pin_memory = device.type != "cpu"
 
@@ -64,10 +66,18 @@ def main():
 
     num_classes = len(tokenizer)
     img_channels = 1
-    rnn_layers = 2
+    rnn_layers = 3
+    rnn_hidden = 384
+    dropout = 0.3
+    conv_channels = [64, 128, 256, 256, 512, 512]
 
     model = CRNN(
-        img_channels=img_channels, num_classes=num_classes, rnn_layers=rnn_layers
+        img_channels=img_channels,
+        num_classes=num_classes,
+        rnn_layers=rnn_layers,
+        rnn_hidden=rnn_hidden,
+        conv_channels=conv_channels,
+        dropout=dropout,
     )
     model.to(device)
 
@@ -78,18 +88,36 @@ def main():
         model = torch.compile(model)
 
     loss_fn = CTCLossWrapper(blank=tokenizer.blank_index)
-    epochs = 80
-    lr = 3e-4
-    weight_decay = 1e-5
-    eta_min = 2e-5
+    epochs = 20
+    lr = 6e-4
+    weight_decay = 1e-4
+    
+   
+
+
     optimizer = optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=weight_decay, fused=True
+        model.parameters(), lr=lr, weight_decay=weight_decay, fused=device.type == "cuda"
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=eta_min
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #   optimizer, T_max=epochs, eta_min=eta_min
+    # )
+    steps_per_epoch = math.ceil(len(train_loader) /accum_steps)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        steps_per_epoch=steps_per_epoch,
+        epochs=epochs,
+        pct_start=0.1,
+        anneal_strategy="cos",
+        div_factor=10.0,
+        final_div_factor=20.0,
     )
+    scheduler.step_per_batch = True
+
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
+     # pull the live config back from the created objects for logging
+    optimizer_config = serialize_optimizer_config(optimizer)
     run_config = {
         "dataset_name": dataset_name,
         "train_samples": len(ds["train"]),
@@ -98,18 +126,14 @@ def main():
         "batch_size": batch_size,
         "accum_steps": accum_steps,
         "lr": lr,
-        "weight_decay": weight_decay,
-        "eta_min": eta_min,
         "epochs": epochs,
-        "model": {
-            "img_channels": img_channels,
-            "num_classes": num_classes,
-            "rnn_layers": rnn_layers,
-            "time_reduction": model.time_reduction,
-        },
+        "optimizer": optimizer_config,
+        "scheduler": scheduler.__class__.__name__,
+        "model": model.to_config()
     }
 
-    run_dir = create_run_dir(base_dir="runs", run_name="test-pretrain-optim")
+
+    run_dir = create_run_dir(base_dir="runs", run_name="pretrain-large-v2")
     print(f"Run directory: {run_dir}")
 
     # for convenience (it goes in checkpoint anyway)
