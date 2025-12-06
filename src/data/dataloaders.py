@@ -1,6 +1,7 @@
 import math
 import random
 import os
+from dataclasses import dataclass
 
 import datasets
 import torch
@@ -8,7 +9,27 @@ import torch
 from .transforms import make_basic_image_transform
 
 
-def ctc_collate(batch):
+@dataclass(slots=True)
+class Batch:
+    images: torch.Tensor  # [B, 1, fixed height, (per batch) max width]
+    targets: torch.Tensor
+    target_lengths: torch.Tensor
+    widths: torch.Tensor
+    ids: list[str | None]
+    texts: list[str]
+
+    def to(self, device: torch.device | str) -> "Batch":
+        return Batch(
+            images=self.images.to(device, non_blocking=True),
+            targets=self.targets.to(device, non_blocking=True),
+            target_lengths=self.target_lengths.to(device, non_blocking=True),
+            widths=self.widths.to(device, non_blocking=True),
+            ids=self.ids,
+            texts=self.texts,
+        )
+
+
+def ctc_collate(batch) -> Batch:
     if not batch:
         raise ValueError("Empty batch passed to collate")
 
@@ -43,14 +64,15 @@ def ctc_collate(batch):
     target_lengths = torch.as_tensor(target_lengths, dtype=torch.long)
     widths_tensor = torch.as_tensor(widths, dtype=torch.long)
 
-    batch_out = {
-        "images": images_padded,  # [B, 1, H, W_max]
-        "targets": targets,  # [sum(target_lengths)]
-        "target_lengths": target_lengths,
-        "widths": widths_tensor,
-        "ids": [b.get("id") for b in batch],
-        "texts": [b.get("text", "") for b in batch],
-    }
+    batch_out = Batch(
+        images=images_padded,  # [B, 1, H, W_max]
+        targets=targets,
+        target_lengths=target_lengths,
+        widths=widths_tensor,
+        ids=[b.get("id") for b in batch],
+        texts=[b.get("text", "") for b in batch],
+    )
+
     return batch_out
 
 
@@ -180,22 +202,22 @@ def make_dataloaders(
             shuffle=True,
         )
         train_loader = torch.utils.data.DataLoader(
-            ds["train"],
+            ds["train"],  # type: ignore[arg-type] (datasets.Dataset should be duck-type compatible with torch.Dataset)
             batch_sampler=train_batch_sampler,
-            **loader_kwargs,
+            **loader_kwargs,  # type: ignore (TypedDict or dataclass would be too much noise here)
         )
     else:
         train_loader = torch.utils.data.DataLoader(
-            ds["train"],
+            ds["train"],  # type: ignore[arg-type]
             batch_size=batch_size,
             shuffle=True,
-            **loader_kwargs,
+            **loader_kwargs,  # type: ignore
         )
 
     test_loader = torch.utils.data.DataLoader(
-        ds["test"],
+        ds["test"],  # type: ignore[arg-type]
         batch_size=batch_size,
         shuffle=False,
-        **loader_kwargs,
+        **loader_kwargs,  # type: ignore
     )
     return train_loader, test_loader

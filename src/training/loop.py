@@ -6,14 +6,15 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.data.tokenization import CharTokenizer
+from src.model.CRNN import CRNN
 
 from .ctc import greedy_ctc_decode
 from .metrics import cer, wer
-from .utils import CheckpointManager, format_metrics, make_log_fn, to_device
+from .utils import CheckpointManager, format_metrics, make_log_fn
 
 
 def train_one_epoch(
-    model: nn.Module,
+    model: CRNN,
     dataloader: DataLoader,
     optimizer: optim.Optimizer,
     loss_fn: nn.Module,
@@ -36,18 +37,13 @@ def train_one_epoch(
     iterator = tqdm(dataloader, desc="Train", leave=False) if use_pbar else dataloader
 
     for step, batch in enumerate(iterator):
-        batch = to_device(batch, device)
+        batch = batch.to(device)
 
-        images = batch["images"]
-        targets = batch["targets"]
-        widths = batch["widths"]
-        target_lengths = batch["target_lengths"]
-
-        input_lengths = model.output_lengths(widths)
+        input_lengths = model.output_lengths(batch.widths)
 
         with autocast_context:
-            logits = model(images)
-            loss = loss_fn(logits, targets, input_lengths, target_lengths)
+            logits = model(batch.images)
+            loss = loss_fn(logits, batch.targets, input_lengths, batch.target_lengths)
             loss = loss / accum_steps
 
         if scaler is not None:
@@ -87,7 +83,7 @@ def train_one_epoch(
 
 
 def evaluate(
-    model: nn.Module,
+    model: CRNN,
     dataloader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
@@ -114,18 +110,12 @@ def evaluate(
         for batch_id, batch in enumerate(iterator):
             if max_batches is not None and batch_id >= max_batches:
                 break
-            batch = to_device(batch, device)
+            batch = batch.to(device)
 
-            images = batch["images"]
-            targets = batch["targets"]
-            widths = batch["widths"]
-            target_lengths = batch["target_lengths"]
-            texts = batch["texts"]
+            input_lengths = model.output_lengths(batch.widths)
 
-            input_lengths = model.output_lengths(widths)
-
-            logits = model(images)
-            loss = loss_fn(logits, targets, input_lengths, target_lengths)
+            logits = model(batch.images)
+            loss = loss_fn(logits, batch.targets, input_lengths, batch.target_lengths)
 
             total_loss += float(loss.item())
             total_batches += 1
@@ -133,13 +123,13 @@ def evaluate(
             if compute_metrics and tokenizer is not None:
                 # decode one batch
                 decoded = greedy_ctc_decode(logits, input_lengths, tokenizer)
-                refs.extend(texts)
+                refs.extend(batch.texts)
                 hyps.extend(decoded)
 
                 if print_samples > 0 and batch_id == 0:
                     for i in range(min(print_samples, len(decoded))):
                         log_fn(
-                            f"[val sample {i}] pred: {decoded[i]!r} | gt: {texts[i]!r}"
+                            f"[val sample {i}] pred: {decoded[i]!r} | gt: {batch.texts[i]!r}"
                         )
 
     avg_loss = total_loss / max(1, total_batches)
