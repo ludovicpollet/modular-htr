@@ -1,4 +1,4 @@
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import torch
 from torch import nn, optim
@@ -8,7 +8,7 @@ from tqdm.auto import tqdm
 from src.data.tokenization import CharTokenizer
 from src.model.CRNN import CRNN
 
-from .ctc import greedy_ctc_decode
+from .ctc import greedy_ctc_decode, build_beam_decoder, beam_ctc_decode
 from .metrics import cer, wer
 from .utils import CheckpointManager, format_metrics, make_log_fn
 
@@ -93,6 +93,7 @@ def evaluate(
     max_batches: int | None = None,
     use_pbar: bool = True,
     log_fn: Callable | None = None,
+    beam_decoder=None,
 ):
     model.eval()
     total_loss = 0.0
@@ -122,7 +123,12 @@ def evaluate(
 
             if compute_metrics and tokenizer is not None:
                 # decode one batch
-                decoded = greedy_ctc_decode(logits, input_lengths, tokenizer)
+                if beam_decoder:
+                    decoded = beam_ctc_decode(
+                        logits, input_lengths, beam_decoder, tokenizer
+                    )
+                else:
+                    decoded = greedy_ctc_decode(logits, input_lengths, tokenizer)
                 refs.extend(batch.texts)
                 hyps.extend(decoded)
 
@@ -161,9 +167,16 @@ def fit(
     metrics_history: list[dict] | None = None,
     use_pbar=True,
     on_epoch_start: Callable | None = None,
+    ctc_decoder_type: Literal["greedy", "beam"] = "greedy",
 ) -> tuple[torch.nn.Module, list[dict]]:
     if metrics_history is None:
         metrics_history = []
+
+    beam_decoder = None
+    if ctc_decoder_type == "beam":
+        if tokenizer is None:
+            raise ValueError("Cannot build a beam search decoder without a tokenizer")
+        beam_decoder = build_beam_decoder(tokenizer)
 
     log = log_fn or make_log_fn(use_pbar)
 
@@ -172,7 +185,7 @@ def fit(
     )
 
     for epoch in epoch_iter:
-        if on_epoch_start: 
+        if on_epoch_start:
             on_epoch_start(epoch, model)
 
         train_metrics = train_one_epoch(
@@ -194,6 +207,7 @@ def fit(
             loss_fn=loss_fn,
             device=device,
             tokenizer=tokenizer,
+            beam_decoder=beam_decoder,
             compute_metrics=compute_metrics,
             print_samples=print_samples,
             max_batches=max_batches,
