@@ -1,4 +1,5 @@
 import torch
+from torchaudio.models.decoder import ctc_decoder
 
 from src.data.tokenization import CharTokenizer
 
@@ -52,3 +53,28 @@ def greedy_ctc_decode(
         text = tokenizer.decode(collapsed)
         texts.append(text)
     return texts
+
+
+def build_beam_decoder(tokenizer: CharTokenizer, beam_size: int = 20, nbest: int = 1):
+    tokens = list(tokenizer.alphabet)
+    blank = tokens[tokenizer.blank_index]
+    return ctc_decoder(
+        lexicon=None,
+        tokens=tokens,
+        blank_token=blank,
+        sil_token=blank,
+        unk_word=None,
+        nbest=nbest,
+        beam_size=beam_size,
+        beam_size_token=min(beam_size, len(tokens)),
+    )
+
+
+def beam_ctc_decode(
+    logits: torch.Tensor, input_lengths: torch.Tensor, decoder, tokenizer: CharTokenizer
+) -> list[str]:
+    # permute logits from [T, B, C] to [B, T, C] before passing
+    log_probs = logits.permute(1, 0, 2).log_softmax(-1).cpu()
+    lengths = input_lengths.cpu()
+    results = decoder(log_probs, lengths)
+    return [tokenizer.decode(hyp[0].tokens) for hyp in results]
