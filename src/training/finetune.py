@@ -60,12 +60,19 @@ def merge_tokenizers(
     )
 
 
-def build_head(old_fc, old_tok, new_tok, device, head_init: str = "copy", new_class_init: str = "zero"):
+def build_head(
+    old_fc,
+    old_tok,
+    new_tok,
+    device,
+    head_init: str = "copy",
+    new_class_init: str = "zero",
+):
     if head_init not in {"copy", "reset"}:
         raise ValueError(f"Unknown head_init strategy: {head_init}")
     if new_class_init not in {"zero", "kaiming"}:
         raise ValueError(f"Unknown new_class_init strategy: {new_class_init}")
-    
+
     new_fc = torch.nn.Linear(old_fc.in_features, len(new_tok), device=device)
     with torch.no_grad():
         torch.nn.init.zeros_(new_fc.bias)
@@ -73,7 +80,7 @@ def build_head(old_fc, old_tok, new_tok, device, head_init: str = "copy", new_cl
             torch.nn.init.kaiming_uniform(new_fc.weight, a=math.sqrt(5))
         else:
             new_fc.weight.zero_()
-        
+
         if head_init == "copy":
             for ch, old_idx in old_tok.index.items():
                 if ch not in new_tok.index:
@@ -86,7 +93,11 @@ def build_head(old_fc, old_tok, new_tok, device, head_init: str = "copy", new_cl
 
 
 def resize_output_layer(
-    model: CRNN, old_tok: CharTokenizer, new_tok: CharTokenizer, head_init: str = "copy", new_class_init: str = "zero"
+    model: CRNN,
+    old_tok: CharTokenizer,
+    new_tok: CharTokenizer,
+    head_init: str = "copy",
+    new_class_init: str = "zero",
 ) -> CRNN:
     if len(old_tok) == len(new_tok) and head_init == "copy":
         return model
@@ -128,7 +139,11 @@ def prepare_finetune_model(
     diff = compare_charsets(pretrained_tok, ft_tok)
     merged_tok = merge_tokenizers(pretrained_tok, ft_tok, drop_unused=drop_unused)
     model = resize_output_layer(
-        model, pretrained_tok, merged_tok, head_init=head_init, new_class_init=new_class_init
+        model,
+        pretrained_tok,
+        merged_tok,
+        head_init=head_init,
+        new_class_init=new_class_init,
     )
     return model, merged_tok, diff
 
@@ -161,29 +176,34 @@ def restore_tokenizer_from_checkpoint(ckpt: dict[str, Any]) -> CharTokenizer | N
 def restore_model_from_checkpoint(
     checkpoint: dict[str, Any], device, override_config: dict[str, Any] | None = None
 ) -> tuple[CRNN, CharTokenizer | None]:
-    model_cfg = checkpoint["config"].get("model")
+    model_cfg = checkpoint.get("model_config") or checkpoint["config"].get("model")
     if override_config is not None:
         model_cfg = override_config
     if model_cfg is None:
         raise ValueError("Checkpoint is missing model configuration.")
+
     tokenizer = restore_tokenizer_from_checkpoint(checkpoint)
     if tokenizer is None:
-        print("Warning: Checkpoint has no tokenizer")
+        print(
+            "Warning: Checkpoint is missing a tokenizer. Will infer num_classes from model size."
+        )
 
-    m = model_cfg
-    conv_channels = m.get("conv_channels") or [64, 128, 256, 256, 512]
-    pool_kernels = [
-        tuple(k) for k in m.get("pool_kernels", [(2, 2), (2, 2), (2, 1), (2, 1)])
-    ]
-    rnn_hidden = m.get("rnn_hidden", 256)
-    dropout = m.get("dropout", 0.2)
-    rnn_layers = m.get("rnn_layers", 2)
-    img_channels = m.get("img_channels", 1)
-    num_classes = len(tokenizer) if tokenizer else m.get("num_classes")
+    try:
+        conv_channels = model_cfg["conv_channels"]
+        pool_kernels = [tuple(k) for k in model_cfg["pool_kernels"]]
+        rnn_hidden = model_cfg["rnn_hidden"]
+        dropout = model_cfg["dropout"]
+        rnn_layers = model_cfg["rnn_layers"]
+        img_channels = model_cfg["img_channels"]
+    except KeyError as e:
+        raise ValueError(f"Checkpoint model config is missing key: {e.args[0]}") from e
+
+    num_classes = len(tokenizer) if tokenizer else model_cfg.get("num_classes")
     if num_classes is None:
         raise ValueError(
             "Could not determine number of output classes to restore model."
         )
+
     model = CRNN(
         img_channels=img_channels,
         num_classes=num_classes,
@@ -226,6 +246,7 @@ def unfreeze_all(model: CRNN) -> None:
     for p in model.parameters():
         p.requires_grad = True
 
+
 def make_unfreeze_callback(unfreeze_epoch, num_stages) -> Callable:
     def on_epoch_start(epoch, model):
         if epoch != unfreeze_epoch:
@@ -236,4 +257,5 @@ def make_unfreeze_callback(unfreeze_epoch, num_stages) -> Callable:
             for stage in model.cnn_stages[:num_stages]:
                 for p in stage.parameters():
                     p.requires_grad = True
+
     return on_epoch_start

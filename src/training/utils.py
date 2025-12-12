@@ -2,7 +2,7 @@ import datetime
 import json
 import pathlib
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Literal
 
 import numpy as np
@@ -10,6 +10,7 @@ import torch
 from tqdm.auto import tqdm
 
 from src.data.tokenization import CharTokenizer
+from src.config import Config
 
 
 def get_device() -> torch.device:
@@ -78,18 +79,26 @@ def create_run_dir(
 
     return run_dir
 
+
 def serialize_optimizer_config(optimizer) -> dict[str, Any]:
     """
-    Serialize the live optimizer configuration.
-    This is only for the human readable run config dump and is not used to restore states.
+    Legacy helper. Should not be used anymore.
+    Serialize the live optimizer configuration only for the human readable run config dump: it is not used to restore states.
     """
+    raise NotImplementedError(
+        "Deprecated function serialize_optimizer_config() is only kept for reference"
+    )
     opt_config = {
         "name": optimizer.__class__.__name__,
         "param_groups": [
             {
                 "lr": pg.get("lr", optimizer.defaults.get("lr")),
-                "weight_decay": pg.get("weight_decay", optimizer.defaults.get("weight_decay")),
-                "betas": list(pg.get("betas", optimizer.defaults.get("betas", (None, None)))),
+                "weight_decay": pg.get(
+                    "weight_decay", optimizer.defaults.get("weight_decay")
+                ),
+                "betas": list(
+                    pg.get("betas", optimizer.defaults.get("betas", (None, None)))
+                ),
                 "eps": pg.get("eps", optimizer.defaults.get("eps")),
                 "fused": pg.get("fused", optimizer.defaults.get("fused")),
             }
@@ -99,9 +108,13 @@ def serialize_optimizer_config(optimizer) -> dict[str, Any]:
     return opt_config
 
 
-def dump_config(run_dir: pathlib.Path, run_config: dict) -> None:
-    with open(run_dir / "config.json", "w") as f:
-        json.dump(run_config, f, indent=2)
+def dump_config(run_dir: pathlib.Path, run_config: Config) -> None:
+    if not run_dir.is_dir():
+        raise FileNotFoundError(
+            f"Cannot save config file. Run directory does not exist: {run_dir}"
+        )
+    path = run_dir / "config.json"
+    path.write_text(json.dumps(asdict(run_config), indent=2, default=str))
 
 
 @dataclass(slots=True)
@@ -118,7 +131,8 @@ class CheckpointManager:
     mode: Literal["min", "max"] = "min"
     top_k: int = 3
     best_checkpoints: list[CheckpointInfo] = field(default_factory=list)
-    config: dict[str, Any] | None = None
+    config: dict[str, Any] | None = None  # for backwards compatibility
+    model_config: dict[str, Any] | None = None
     tokenizer: CharTokenizer | None = None
 
     def __post_init__(self):
@@ -145,7 +159,7 @@ class CheckpointManager:
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
             "scaler_state_dict": scaler.state_dict() if scaler else None,
             "metrics": dict(val_metrics),
-            "config": self.config,
+            "model_config": self.model_config or (self.config or {}).get("model"),
         }
         if self.tokenizer is not None:
             state["tokenizer"] = self.tokenizer.to_dict()
