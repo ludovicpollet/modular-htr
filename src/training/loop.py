@@ -21,6 +21,7 @@ def train_one_epoch(
     device: torch.device,
     scaler=None,
     scheduler=None,
+    step_per_batch: bool = False,
     grad_clip_norm: float | None = 1.0,
     accum_steps: int = 1,
     use_pbar: bool = True,
@@ -65,17 +66,13 @@ def train_one_epoch(
 
             optimizer.zero_grad(set_to_none=True)
 
-            if (
-                scheduler is not None
-                and hasattr(scheduler, "step_per_batch")
-                and scheduler.step_per_batch
-            ):
+            if scheduler is not None and step_per_batch:
                 scheduler.step()
 
         running_loss += loss.item() * accum_steps
         num_batches += 1
 
-    if scheduler is not None and not getattr(scheduler, "step_per_batch", False):
+    if scheduler is not None and not step_per_batch:
         scheduler.step()
 
     avg_loss = running_loss / max(1, num_batches)
@@ -155,6 +152,7 @@ def fit(
     device,
     scaler=None,
     scheduler=None,
+    step_per_batch: bool = False,
     epochs: int = 40,
     grad_clip_norm: float | None = 1.0,
     accum_steps: int = 1,
@@ -196,6 +194,7 @@ def fit(
             device=device,
             scaler=scaler,
             scheduler=scheduler,
+            step_per_batch=step_per_batch,
             grad_clip_norm=grad_clip_norm,
             accum_steps=accum_steps,
             use_pbar=use_pbar,
