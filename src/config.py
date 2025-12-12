@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 from pathlib import Path
 
+import tyro
+
 
 @dataclass
 class Dataset:
@@ -42,13 +44,13 @@ class Checkpoint:
 
 @dataclass
 class CTCDecoder:
-    # The type of decoder to use:
+    # The type of decoder to use.
     mode: Literal["greedy", "beam"] = "beam"
-    # Size of the beam (unused for mode=greedy)
+    # Size of the beam (unused for mode=greedy).
     beam_size: int = 20
-    # Path to a KenLM language model (only implemented for the beam decoder)
+    # Path to a KenLM language model (only implemented for the beam decoder).
     lm_path: Path | None = None
-    # Relative importance given to the LM (beam mode only)
+    # Relative importance given to the LM (beam mode only).
     lm_alpha: float = 0.5
 
 
@@ -82,7 +84,7 @@ class CRNNConfig:
     )
     # Pooling kernel sizes for each conv block. This is what determines sequence length reduction along the time dimension.
     pool_kernels: list[tuple[int, int]] = field(
-        default_factory=lambda: [(2, 2), (2, 2), (2, 2), (2, 1)]
+        default_factory=lambda: [(2, 2), (2, 2), (2, 1), (2, 1)]
     )
     # Dropout probability applied to encoder features.
     dropout: float = 0.3
@@ -100,23 +102,26 @@ class OptimAdamwConfig:
 @dataclass
 class Onecycle:
     # Annealing strategy for LR schedule
-    anneal_strategy: str = "cos"
+    anneal_strategy: Literal["cos", "linear"] = "cos"
     # Fraction of total training where LR increases before annealing.
     pct_start: float = 0.1
     # Initial LR = max_lr / div_factor.
     div_factor: float = 10.0
     # Final LR = max_lr / final_div_factor.
     final_div_factor: float = 10.0
-    # Whether to update LR every batch (True) or every epoch (False).
-    step_per_batch: bool = True
+    # Update the LR every batch instead of every epoch.
+    step_per_batch: tyro.conf.Fixed[bool] = True
+    
     # epochs must be inferred from the trainer config
     # max_lr must be inferred from optim config
 
 
 @dataclass
 class Cosine:
-    # Minimum learning rate reached at the end of cosine schedule
+    # Minimum learning rate reached at the end of cosine schedule.
     eta_min: float = 1e-5
+    # Update the LR every epoch.
+    step_per_batch: tyro.conf.Fixed[bool] = False
     # max_T must be inferred from the trainer config
 
 
@@ -132,7 +137,7 @@ class Strategy:
     new_symbols_init: Literal["zero", "kaiming"] = "kaiming"
     # The number of convolution stages (conv + pool) to freeze (zero to disable).
     freeze_n_stages: int = 0
-    # Number of epochs after which we unfreeze the whole network. Disabled if nothing was frozen.
+    # Number of epochs after which we unfreeze the whole network (zero to keep frozen).
     unfreeze_epoch: int = 5
 
     
