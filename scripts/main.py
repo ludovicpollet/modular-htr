@@ -1,44 +1,68 @@
 import math
+
 import torch
 import tyro
 from datasets import load_from_disk
 
 import src.config
 from src.data.dataloaders import make_dataloaders
-from src.data.tokenization import build_char_tokenizer, apply_ctc_tokenizer
+from src.data.tokenization import apply_ctc_tokenizer, build_char_tokenizer
 from src.model.CRNN import CRNN
+from src.model.HTRModel import HTRModel
 from src.training.ctc import CTCLossWrapper
-from src.training.loop import fit
+from src.training.finetune import (
+    freeze_cnn_stages,
+    make_unfreeze_callback,
+    prepare_finetune_model,
+)
+from src.training.loop import Trainer
 from src.training.utils import (
     CheckpointManager,
     configure_torch,
     create_run_dir,
     dump_config,
     get_device,
+    log_model_info,
     set_all_seeds,
 )
-from src.training.finetune import (
-    prepare_finetune_model,
-    freeze_cnn_stages,
-    make_unfreeze_callback,
-)
-
+from src.types import MonitorMetric
 
 type Scheduler = (
     torch.optim.lr_scheduler.OneCycleLR | torch.optim.lr_scheduler.CosineAnnealingLR
 )
 
 
-def build_model(cfg: src.config.CRNNConfig, num_classes: int) -> CRNN:
-    model = CRNN(
-        img_channels=cfg.img_channels,
-        num_classes=num_classes,
-        rnn_layers=cfg.rnn_layers,
-        rnn_hidden=cfg.rnn_hidden,
-        conv_channels=cfg.conv_channels,
-        dropout=cfg.dropout,
-    )
-    return model
+def build_model(
+    cfg: src.config.Model, num_classes: int, input_height: int | None = None
+) -> CRNN | HTRModel:
+    if isinstance(cfg, src.config.CRNNConfig):
+        model = CRNN(
+            img_channels=cfg.img_channels,
+            num_classes=num_classes,
+            rnn_layers=cfg.rnn_layers,
+            rnn_hidden=cfg.rnn_hidden,
+            conv_channels=cfg.conv_channels,
+            dropout=cfg.dropout,
+        )
+        return model
+    if isinstance(cfg, src.config.ModelConfig):
+        model = HTRModel(
+            img_channels=cfg.img_channels,
+            num_classes=num_classes,
+            num_layers=cfg.num_layers,
+            hidden_size=cfg.hidden_size,
+            backbone_channels=cfg.conv_channels,
+            dropout=cfg.dropout,
+            seq_encoder_type=cfg.seq_encoder,
+            norm_type=cfg.norm_type,
+            use_temporal_conv=cfg.temporal_convolution,
+            input_height=input_height,
+            height_collapse=cfg.height_collapse,
+            use_se=True,
+            channels_last=True,
+        )
+        return model
+    raise NotImplementedError(f"Unkown model type: {cfg.__class__.__name__}")
 
 
 def build_optimizer(
@@ -76,19 +100,18 @@ def build_scheduler(
             epochs=epochs,
             steps_per_epoch=steps_per_epoch,
             pct_start=cfg.pct_start,
-            anneal_strategy=cfg.anneal_strategy,
+            anneal_strategy=cfg.anneal_strategy.value,
             div_factor=cfg.div_factor,
             final_div_factor=cfg.final_div_factor,
         )
         return scheduler
-    raise ValueError("Unkown scheduler config")
+    raise NotImplementedError("Unkown scheduler config")
 
 
 def run_training(cfg: src.config.Train) -> None:
     set_all_seeds(cfg.seed)
     configure_torch(benchmark=cfg.trainer.torch_benchmark)
     device = get_device()
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None  # type: ignore (stubs out of date)
 
     ds = load_from_disk(cfg.data.dataset.path)
     text_col = cfg.data.dataset.text_col
@@ -104,7 +127,10 @@ def run_training(cfg: src.config.Train) -> None:
         pin_memory=device.type != "cpu",
     )
 
-    model = build_model(cfg.model, num_classes=len(tokenizer))
+    model = build_model(
+        cfg.model, num_classes=len(tokenizer), input_height=cfg.data.fixed_height
+    )
+    log_model_info(model)
     model.to(device)
 
     epochs = cfg.trainer.epochs
@@ -120,39 +146,39 @@ def run_training(cfg: src.config.Train) -> None:
     run_dir = create_run_dir(cfg.base_dir, cfg.run_name)
     dump_config(run_dir, cfg)
 
+    if cfg.trainer.checkpoint.compute_error_rates:
+        monitor_metric = cfg.trainer.checkpoint.monitor
+    else:
+        monitor_metric = MonitorMetric.VAL_LOSS
+
     checkpoint_manager = CheckpointManager(
         save_dir=run_dir,
-        monitor=cfg.trainer.checkpoint.monitor,
+        monitor=monitor_metric,
         mode=cfg.trainer.checkpoint.metric_mode,
         top_k=cfg.trainer.checkpoint.top_k,
         model_config=model.to_config(),
+        tokenizer=tokenizer,
     )
-
-    model, _metrics_history = fit(
+    trainer = Trainer(
         model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
         optimizer=optimizer,
-        accum_steps=accum_steps,
         loss_fn=loss_fn,
         device=device,
-        scaler=scaler,
+        tokenizer=tokenizer,
+        cfg=cfg.trainer,
         scheduler=scheduler,
         step_per_batch=step_per_batch,
-        epochs=epochs,
-        tokenizer=tokenizer,
-        print_samples=cfg.trainer.checkpoint.print_samples,
-        full_eval_interval=cfg.trainer.checkpoint.full_eval_interval,
+        ctc_decoder_mode=cfg.decoder.mode,
         checkpoint_manager=checkpoint_manager,
-        ctc_decoder_type=cfg.decoder.mode,
     )
+
+    model, _metrics_history = trainer.fit(train_loader, val_loader)
 
 
 def run_finetune(cfg: src.config.Finetune) -> None:
     set_all_seeds(cfg.seed)
     configure_torch(benchmark=cfg.trainer.torch_benchmark)
     device = get_device()
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None  # type: ignore (stubs out of date)
 
     finetune_ds = load_from_disk(cfg.data.dataset.path)
 
@@ -196,6 +222,20 @@ def run_finetune(cfg: src.config.Finetune) -> None:
         mode=cfg.trainer.checkpoint.metric_mode,
         top_k=cfg.trainer.checkpoint.top_k,
         model_config=model.to_config(),
+        tokenizer=tokenizer,
+    )
+
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        device=device,
+        tokenizer=tokenizer,
+        cfg=cfg.trainer,
+        scheduler=scheduler,
+        step_per_batch=step_per_batch,
+        ctc_decoder_mode=cfg.decoder.mode,
+        checkpoint_manager=checkpoint_manager,
     )
 
     unfreeze_callback = None
@@ -206,31 +246,19 @@ def run_finetune(cfg: src.config.Finetune) -> None:
                 unfreeze_epoch=cfg.strategy.unfreeze_epoch, num_stages=None
             )
 
-    model, _metrics_history = fit(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        optimizer=optimizer,
-        accum_steps=accum_steps,
-        loss_fn=loss_fn,
-        device=device,
-        scaler=scaler,
-        scheduler=scheduler,
-        step_per_batch=step_per_batch,
-        epochs=epochs,
-        tokenizer=tokenizer,
-        print_samples=cfg.trainer.checkpoint.print_samples,
-        full_eval_interval=cfg.trainer.checkpoint.full_eval_interval,
-        checkpoint_manager=checkpoint_manager,
-        ctc_decoder_type=cfg.decoder.mode,
-        on_epoch_start=unfreeze_callback,
+    model, _metrics_history = trainer.fit(
+        train_loader, val_loader, on_epoch_start=unfreeze_callback
     )
 
 
 def main():
     cfg = tyro.cli(
         src.config.Config,  # type: ignore (tyro doesn't get the type alias)
-        config=(tyro.conf.CascadeSubcommandArgs, tyro.conf.FlagConversionOff),
+        config=(
+            tyro.conf.CascadeSubcommandArgs,
+            tyro.conf.FlagConversionOff,
+            tyro.conf.EnumChoicesFromValues,
+        ),
     )
     if isinstance(cfg, src.config.Train):
         run_training(cfg)

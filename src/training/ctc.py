@@ -1,3 +1,5 @@
+from typing import Literal
+
 import torch
 from torchaudio.models.decoder import ctc_decoder
 
@@ -5,11 +7,12 @@ from src.data.tokenization import CharTokenizer
 
 
 class CTCLossWrapper(torch.nn.Module):
-    def __init__(self, blank: int = 0):
+    def __init__(self, blank: int = 0, normalize: Literal["target", "batch"] = "target"):
         super().__init__()
+        self.normalize = normalize
         self.ctc = torch.nn.CTCLoss(
             blank=blank,
-            reduction="mean",
+            reduction="sum",
             zero_infinity=True,  # to avoid NaNs when target longer than input
         )
 
@@ -20,8 +23,16 @@ class CTCLossWrapper(torch.nn.Module):
         input_lengths: torch.Tensor,
         target_lengths: torch.Tensor,
     ) -> torch.Tensor:
-        log_probs = logits.log_softmax(dim=-1)
-        return self.ctc(log_probs, targets, input_lengths, target_lengths)
+        log_probs = logits.float().log_softmax(dim=-1) # cast to float to stay in fp32 even under autocast
+        loss = self.ctc(log_probs, targets, input_lengths, target_lengths)
+
+        if self.normalize == "target":
+            denom = target_lengths.sum().clamp_min(1)
+        elif self.normalize == "batch":
+            denom = target_lengths.numel()
+        else:
+            raise ValueError(f"Unknown normalize={self.normalize!r}")
+        return loss / denom
 
 
 def greedy_ctc_decode(

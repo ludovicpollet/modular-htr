@@ -1,9 +1,10 @@
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Annotated
 from pathlib import Path
 
 import tyro
 
+from src import types
 
 @dataclass
 class Dataset:
@@ -19,7 +20,7 @@ class Dataset:
 class Data:
     dataset: Dataset
     # Height of a line image after resize.
-    fixed_height: int = 96
+    fixed_height: int = 48
     # Number of workers to spawn for dataset processing AND dataloading.
     num_workers: int = 24
     # Training batch size.
@@ -30,22 +31,25 @@ class Data:
 
 @dataclass
 class Checkpoint:
+    # Set to False to disable computing the character/word error rates.
+    compute_error_rates: bool = True
     # The metric to monitor when deciding which checkpoints to keep.
-    monitor: Literal["cer", "wer", "val_loss"] = "cer"
+    # Will be forced to val_loss if compute_error_rates is set to False.
+    monitor: types.MonitorMetric = types.MonitorMetric.CER
     # Use min if smaller is better for the chosen metric.
-    metric_mode: Literal["min", "max"] = "min"
+    metric_mode: types.MetricMode = types.MetricMode.MIN
     # Max number of checkpoints to keep.
     top_k: int = 3
     # Number of epochs between evals (those won't be considered for checkpointing).
     full_eval_interval: int = 1
     # Number of samples to print after eval for visual inspection. Zero to disable. 
-    print_samples: int = 3
+    print_samples: int = 0
 
 
 @dataclass
 class CTCDecoder:
     # The type of decoder to use.
-    mode: Literal["greedy", "beam"] = "beam"
+    mode: types.CTCDecoderMode = types.CTCDecoderMode.GREEDY
     # Size of the beam (unused for mode=greedy).
     beam_size: int = 20
     # Path to a KenLM language model (only implemented for the beam decoder).
@@ -65,7 +69,14 @@ class Trainer:
     # Number of gradient accumulation steps before each optimizer update.
     accum_steps: int = 1
     # Maximum gradient norm for gradient clipping. Low values may help stabilize training.
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 5.0
+    # Enables Automatic Mixed Precision [AMP] casting in chosen regions to improve performance; will also enable gradient scaling to improve convergence.
+    # Setting to true might make CTC training brittle.
+    amp: bool = False
+    # Enables logging of per-batch diagnostics. Use "print" to emit to console, "log" to only write CSV, None to disable.
+    debug: types.DebugMode | None = None
+    # Disable the progress bars
+    disable_pbars: bool = False
 
     checkpoint: Checkpoint = field(default_factory=Checkpoint)
 
@@ -89,6 +100,55 @@ class CRNNConfig:
     # Dropout probability applied to encoder features.
     dropout: float = 0.3
 
+@dataclass
+class DropoutConfig:
+    """Dropout configuration for all model components"""
+
+    # Dropout2d after CNN stages (spatial dropout)
+    conv: float = 0.1
+    # Dropout2d inside ResidualBlocks
+    residual: float = 0.
+    # Dropout in TemporalConvBlock
+    temporal: float = 0.15
+    # Dropout on attention weights in the height collapse
+    height_attention: float = 0.1
+    # Dropout after position encoding
+    pos_encoding: float = 0.1
+    # Sequence encoder dropout (between layers if LSTM, internal if Transfomer)
+    encoder: float = 0.3
+    # Dropout before final FC layer
+    classifier: float = 0.3
+
+@dataclass
+class ModelConfig:
+    # Number of input image channels (e.g. 1 for grayscale).
+    img_channels: int = 1
+
+    # Outputs channels for each cnn stage (lenght determines number of stages).
+    conv_channels: list[int] = field(
+        default_factory=lambda: [64, 128, 256, 384]
+    )
+    # Pooling kernels (H, W) for each stage. Drives spatial reduction along height and time dimensions.
+    pool_kernels: list[tuple[int, int]] = field(
+        default_factory=lambda: [(2, 2), (2, 2), (2, 1), (2, 1)]
+    )
+    # How to collapse height after CNN
+    height_collapse: types.HeightCollapseMode = types.HeightCollapseMode.ATTENTION
+    # Add residual 1D convolutions over time before the seq encoder
+    temporal_convolution: bool = True
+    # Type of the sequence encoder block
+    seq_encoder: types.SequenceEncoderType = types.SequenceEncoderType.TRANSFORMER
+    # Number of recurrent layers stacked after the convolutional encoder.
+    num_layers: int = 4
+    # Hidden size of the recurrent layers.
+    hidden_size: int = 384
+    # Whether to use self excitation
+    self_excitation: bool = True
+    # Dropout configuration
+    dropout: DropoutConfig = field(default_factory=DropoutConfig)
+    # Normalization type. Group is more stable for small batches.
+    norm_type: types.NormType = types.NormType.GROUP
+
 
 @dataclass
 class OptimAdamwConfig:
@@ -102,7 +162,7 @@ class OptimAdamwConfig:
 @dataclass
 class Onecycle:
     # Annealing strategy for LR schedule
-    anneal_strategy: Literal["cos", "linear"] = "cos"
+    anneal_strategy: types.AnnealStrategy = types.AnnealStrategy.COS
     # Fraction of total training where LR increases before annealing.
     pct_start: float = 0.1
     # Initial LR = max_lr / div_factor.
@@ -131,16 +191,16 @@ class Strategy:
     # Makes no difference if head_init_mode=="reset"
     drop_unused_symbols: bool = True
     # Whether or not the weights from the pretrained head are copied to the new one.
-    head_init_mode: Literal["copy", "reset"] = "copy"
+    head_init_mode: types.NewHeadInit = types.NewHeadInit.COPY
     # How to initialise the new weights.
     # Makes no difference if head_init_mode=="copy" and drop_unused_symbols=="true"
-    new_symbols_init: Literal["zero", "kaiming"] = "kaiming"
+    new_symbols_init: types.NewSymbolsInit = types.NewSymbolsInit.KAIMING
     # The number of convolution stages (conv + pool) to freeze (zero to disable).
     freeze_n_stages: int = 0
     # Number of epochs after which we unfreeze the whole network (zero to keep frozen).
     unfreeze_epoch: int = 5
 
-    
+type Model = Annotated[CRNNConfig, tyro.conf.subcommand("vanilla")] | Annotated[ModelConfig, tyro.conf.subcommand("v2")]
 type Scheduler = Cosine | Onecycle
 type Config = Train | Finetune
 
@@ -156,7 +216,7 @@ class Train:
     # Directory where training runs artifacts are stored 
     base_dir: str = "runs"
 
-    model: CRNNConfig = field(default_factory=CRNNConfig)
+    model: Model = field(default_factory=CRNNConfig)
     optim: OptimAdamwConfig = field(default_factory=OptimAdamwConfig)
     # Choose a scheduler with its subcommand to see its relevant parameters and defaults.
     scheduler: Scheduler = field(default_factory=Cosine)

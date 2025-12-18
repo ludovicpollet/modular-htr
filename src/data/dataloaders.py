@@ -87,22 +87,13 @@ class BucketByWidthSampler(torch.utils.data.Sampler):
 
     def __iter__(self):
         indices = self.indices.copy()
-        if self.shuffle:
-            chunk_size = self.batch_size * 20
-            chunks = [
-                indices[i : i + chunk_size] for i in range(0, len(indices), chunk_size)
-            ]
-            random.shuffle(chunks)
-            indices = [i for chunk in chunks for i in chunk]
 
-        batch = []
-        for idx in indices:
-            batch.append(idx)
-            if len(batch) == self.batch_size:
-                yield batch
-                batch = []
-        if batch:
-            yield batch
+        batches = [indices[i:i+self.batch_size] for i in range(0, len(indices), self.batch_size)]
+
+        if self.shuffle:
+            random.shuffle(batches)
+
+        yield from batches
 
     def __len__(self):
         return math.ceil(len(self.indices) / self.batch_size)

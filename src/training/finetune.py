@@ -7,6 +7,7 @@ import torch
 
 from src.data.tokenization import CharTokenizer, build_char_tokenizer
 from src.model.CRNN import CRNN
+from src.types import NewHeadInit, NewSymbolsInit
 
 
 @dataclass
@@ -65,30 +66,25 @@ def build_head(
     old_tok,
     new_tok,
     device,
-    head_init: str = "copy",
-    new_class_init: str = "zero",
+    head_init: NewHeadInit,
+    new_class_init: NewSymbolsInit,
 ):
-    if head_init not in {"copy", "reset"}:
-        raise ValueError(f"Unknown head_init strategy: {head_init}")
-    if new_class_init not in {"zero", "kaiming"}:
-        raise ValueError(f"Unknown new_class_init strategy: {new_class_init}")
-
     new_fc = torch.nn.Linear(old_fc.in_features, len(new_tok), device=device)
     with torch.no_grad():
         torch.nn.init.zeros_(new_fc.bias)
-        if new_class_init == "kaiming":
+        if new_class_init is NewSymbolsInit.KAIMING:
             torch.nn.init.kaiming_uniform(new_fc.weight, a=math.sqrt(5))
-        else:
+        else:  # ZERO
             new_fc.weight.zero_()
 
-        if head_init == "copy":
+        if head_init is NewHeadInit.COPY:
             for ch, old_idx in old_tok.index.items():
                 if ch not in new_tok.index:
                     continue
                 new_idx = new_tok.index[ch]
                 new_fc.weight[new_idx] = old_fc.weight[old_idx]
                 new_fc.bias[new_idx] = old_fc.bias[old_idx]
-        # the head_init == "reset" case is handled by the zero init above
+        # the RESET case is handled by the zero init above
     return new_fc
 
 
@@ -96,10 +92,10 @@ def resize_output_layer(
     model: CRNN,
     old_tok: CharTokenizer,
     new_tok: CharTokenizer,
-    head_init: str = "copy",
-    new_class_init: str = "zero",
+    head_init: NewHeadInit,
+    new_class_init: NewSymbolsInit,
 ) -> CRNN:
-    if len(old_tok) == len(new_tok) and head_init == "copy":
+    if len(old_tok) == len(new_tok) and head_init is NewHeadInit.COPY:
         return model
 
     device = next(model.parameters()).device  # keep new head on the same device
@@ -123,9 +119,14 @@ def prepare_finetune_model(
     device: torch.device | str = "cpu",
     drop_unused: bool = False,
     override_config: dict[str, Any] | None = None,
-    head_init: str = "copy",
-    new_class_init: str = "zero",
+    head_init: NewHeadInit | str = NewHeadInit.COPY,
+    new_class_init: NewSymbolsInit | str = NewSymbolsInit.KAIMING,
 ) -> tuple[CRNN, CharTokenizer, CharsetDiff]:
+    """High level convenience to build a model for finetuning from a checkpoint and handle alphabet differences"""
+    # coerce eventual strings arguments to enum types
+    head_init = NewHeadInit(head_init)
+    new_class_init = NewSymbolsInit(new_class_init)
+
     model, pretrained_tok, _ckpt = load_pretrained_model(
         checkpoint_path, device=device, override_config=override_config
     )

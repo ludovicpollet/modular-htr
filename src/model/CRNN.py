@@ -76,6 +76,11 @@ class CRNN(nn.Module):
         # Linear projection to classes for CTC (needs 2*rnn_hidden because bidirectional)
         self.fc = nn.Linear(2 * self.rnn_hidden, self.num_classes)
 
+        # try to avoid full blank collapse at the beginning:
+        # with torch.no_grad():
+        #     self.fc.bias.zero_()
+        #     self.fc.bias[0] = -5.0
+
     def output_lengths(self, widths: torch.Tensor) -> torch.Tensor:
         """Map image widths (post preprocessing, in pixels) to sequence lengths (T) for CTC"""
         return widths // self.time_reduction

@@ -1,243 +1,387 @@
-from typing import Any, Callable, Literal
+import csv
+import math
+from contextlib import AbstractContextManager, nullcontext
+from pathlib import Path
+from typing import Any, Callable
 
 import torch
-from torch import nn, optim
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from src.config import Trainer as TrainerConfig
 from src.data.tokenization import CharTokenizer
 from src.model.CRNN import CRNN
+from src.model.HTRModel import HTRModel
+from src.types import CTCDecoderMode, DebugMode
 
-from .ctc import greedy_ctc_decode, build_beam_decoder, beam_ctc_decode
+from .ctc import CTCLossWrapper, beam_ctc_decode, build_beam_decoder, greedy_ctc_decode
 from .metrics import cer, wer
-from .utils import CheckpointManager, format_metrics, make_log_fn
+from .utils import CheckpointManager, format_metrics
+
+type Model = CRNN | HTRModel
 
 
-def train_one_epoch(
-    model: CRNN,
-    dataloader: DataLoader,
-    optimizer: optim.Optimizer,
-    loss_fn: nn.Module,
-    device: torch.device,
-    scaler=None,
-    scheduler=None,
-    step_per_batch: bool = False,
-    grad_clip_norm: float | None = 1.0,
-    accum_steps: int = 1,
-    use_pbar: bool = True,
-):
-    model.train()
-    running_loss = 0.0
-    num_batches = 0
+class Trainer:
+    def __init__(
+        self,
+        model: Model,
+        optimizer: torch.optim.Optimizer,
+        loss_fn: CTCLossWrapper,
+        device: torch.device,
+        tokenizer: CharTokenizer,
+        cfg: TrainerConfig,
+        scheduler=None,
+        step_per_batch: bool = False,
+        ctc_decoder_mode: CTCDecoderMode | str = CTCDecoderMode.GREEDY,
+        checkpoint_manager: CheckpointManager | None = None,
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+        self.device = device
+        self.tokenizer = tokenizer
+        self.cfg = cfg
+        self.scheduler = scheduler
+        self.ctc_decoder_mode = CTCDecoderMode(ctc_decoder_mode)  # coerce if string
+        self.checkpoint_manager = checkpoint_manager
+        self.step_per_batch = step_per_batch
 
-    use_autocast = (scaler is not None) and (device.type in ("cuda", "xpu", "hpu"))
-    autocast_context = torch.autocast(device_type=device.type, enabled=use_autocast)
+        self.use_pbars = not self.cfg.disable_pbars
+        self.debug_enabled = cfg.debug is not None
 
-    optimizer.zero_grad(set_to_none=True)
+        self.use_autocast = cfg.amp and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda") if self.use_autocast else None  # type: ignore (stubs out of date)
 
-    iterator = tqdm(dataloader, desc="Train", leave=False) if use_pbar else dataloader
+        if self.tokenizer.blank_index != self.loss_fn.ctc.blank:
+            raise ValueError(
+                f"tokenizer blank: {self.tokenizer.blank_index}; ctc_loss blank: {self.loss_fn.ctc.blank}"
+            )
+        self.beam_decoder = None
+        if self.ctc_decoder_mode is CTCDecoderMode.BEAM:
+            if self.tokenizer.blank_index != 0:
+                raise ValueError(
+                    "Blank index must be 0 to use the Flashlight beam search decoder."
+                )
+            self.beam_decoder = build_beam_decoder(self.tokenizer)
 
-    for step, batch in enumerate(iterator):
-        batch = batch.to(device)
+    def train_one_epoch(self, current_epoch: int, dataloader: DataLoader):
+        running_loss = 0.0
+        num_batches = 0
+        debug_records: list[dict[str, Any]] = []
+        self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
 
-        input_lengths = model.output_lengths(batch.widths)
+        iterator = (
+            tqdm(dataloader, desc="Train", leave=False)
+            if self.use_pbars
+            else dataloader
+        )
+        for step, batch in enumerate(iterator):
+            # --- data ---
+            batch = batch.to(self.device)
+            input_lengths = self.model.output_lengths(batch.widths)
 
-        with autocast_context:
-            logits = model(batch.images)
-            loss = loss_fn(logits, batch.targets, input_lengths, batch.target_lengths)
-            loss = loss / accum_steps
+            # --- forward pass ---
+            blank_rate = None
+            with self._autocast():
+                logits = self.model(batch.images, batch.widths)
+                T = int(logits.size(0))
+                B = int(logits.size(1))
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+                if self.debug_enabled:
+                    blank_rate = self._compute_blank_rate(logits, input_lengths)
 
-        if (step + 1) % accum_steps == 0:
-            if grad_clip_norm is not None:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                # --- compute loss---
+                loss = self.loss_fn(
+                    logits, batch.targets, input_lengths, batch.target_lengths
+                )
+                loss = loss / self.cfg.accum_steps
 
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
+            # --- backward pass ---
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
             else:
-                optimizer.step()
+                loss.backward()
 
-            optimizer.zero_grad(set_to_none=True)
+            do_step = (step + 1) % self.cfg.accum_steps == 0
 
-            if scheduler is not None and step_per_batch:
-                scheduler.step()
+            if do_step:
+                dbg: dict[str, Any] = {}
+                if self.debug_enabled:
+                    dbg["epoch"] = current_epoch
+                    dbg["step"] = step
+                    dbg["T"] = T
+                    dbg["B"] = B
+                    dbg["blank_rate"] = blank_rate
+                    dbg["pm_before"] = self._param_checksum()
 
-        running_loss += loss.item() * accum_steps
-        num_batches += 1
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
 
-    if scheduler is not None and not step_per_batch:
-        scheduler.step()
+                if self.debug_enabled:
+                    dbg["grad_norm_before"] = self._global_grad_norm()
 
-    avg_loss = running_loss / max(1, num_batches)
-    return {"loss": avg_loss}
-
-
-def evaluate(
-    model: CRNN,
-    dataloader: DataLoader,
-    loss_fn: nn.Module,
-    device: torch.device,
-    tokenizer: CharTokenizer | None = None,
-    compute_metrics: bool = False,
-    print_samples: int = 0,
-    max_batches: int | None = None,
-    use_pbar: bool = True,
-    log_fn: Callable | None = None,
-    beam_decoder=None,
-):
-    model.eval()
-    total_loss = 0.0
-    total_batches = 0
-
-    if log_fn is None:
-        log_fn = make_log_fn(use_pbar)
-
-    iterator = tqdm(dataloader, desc="Eval", leave=False) if use_pbar else dataloader
-
-    refs = []
-    hyps = []
-
-    with torch.inference_mode():
-        for batch_id, batch in enumerate(iterator):
-            if max_batches is not None and batch_id >= max_batches:
-                break
-            batch = batch.to(device)
-
-            input_lengths = model.output_lengths(batch.widths)
-
-            logits = model(batch.images)
-            loss = loss_fn(logits, batch.targets, input_lengths, batch.target_lengths)
-
-            total_loss += float(loss.item())
-            total_batches += 1
-
-            if compute_metrics and tokenizer is not None:
-                # decode one batch
-                if beam_decoder:
-                    decoded = beam_ctc_decode(
-                        logits, input_lengths, beam_decoder, tokenizer
+                if self.cfg.grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.cfg.grad_clip_norm
                     )
+                    if self.debug_enabled:
+                        dbg["grad_norm_after"] = self._global_grad_norm()
                 else:
-                    decoded = greedy_ctc_decode(logits, input_lengths, tokenizer)
-                refs.extend(batch.texts)
-                hyps.extend(decoded)
+                    if self.debug_enabled:
+                        dbg["grad_norm_after"] = None
 
-                if print_samples > 0 and batch_id == 0:
-                    for i in range(min(print_samples, len(decoded))):
-                        log_fn(
-                            f"[val sample {i}] pred: {decoded[i]!r} | gt: {batch.texts[i]!r}"
+                # --- optimizer/scaler step ---
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+
+                if self.debug_enabled:
+                    pm_after = self._param_checksum()
+                    dbg["pm_delta"] = pm_after - dbg["pm_before"]
+
+                    grad_before = (
+                        f"{dbg['grad_norm_before']:.3e}"
+                        if dbg["grad_norm_before"] is not None
+                        else "n/a"
+                    )
+                    if self.cfg.grad_clip_norm is None:
+                        grad_after = "skip"
+                    else:
+                        grad_after = (
+                            f"{dbg['grad_norm_after']:.3e}"
+                            if dbg["grad_norm_after"] is not None
+                            else "n/a"
+                        )
+                    blank_rate_str = (
+                        f"{blank_rate:.3f}" if blank_rate is not None else "n/a"
+                    )
+
+                    if self.cfg.debug is DebugMode.PRINT:
+                        tqdm.write(
+                            f"[dbg] step={step} T={T} B={B} "
+                            f"blank_rate={blank_rate_str} "
+                            f"grad_norm_before_clip={grad_before} "
+                            f"grad_norm_after_clip={grad_after} "
+                            f"pm_delta={dbg['pm_delta']:+.2e}"
                         )
 
-    avg_loss = total_loss / max(1, total_batches)
-    out = {"loss": avg_loss}
-    if compute_metrics and tokenizer:
-        out["cer"] = cer(refs, hyps)
-        out["wer"] = wer(refs, hyps)
-    return out
+                    debug_records.append(
+                        {
+                            "epoch": dbg["epoch"],
+                            "step": dbg["step"],
+                            "T": dbg["T"],
+                            "blank_rate": dbg["blank_rate"],
+                            "grad_norm_before": dbg["grad_norm_before"],
+                            "grad_norm_after": dbg["grad_norm_after"],
+                            "pm_delta": dbg["pm_delta"],
+                        }
+                    )
 
+                self.optimizer.zero_grad(set_to_none=True)
 
-def fit(
-    model,
-    train_loader,
-    val_loader,
-    optimizer,
-    loss_fn,
-    device,
-    scaler=None,
-    scheduler=None,
-    step_per_batch: bool = False,
-    epochs: int = 40,
-    grad_clip_norm: float | None = 1.0,
-    accum_steps: int = 1,
-    log_fn: Callable[[str], None] | None = None,
-    tokenizer=None,
-    print_samples=3,
-    max_batches=None,
-    full_eval_interval: int = 5,
-    checkpoint_manager: CheckpointManager | None = None,
-    metrics_history: list[dict] | None = None,
-    use_pbar=True,
-    on_epoch_start: Callable | None = None,
-    ctc_decoder_type: Literal["greedy", "beam"] = "greedy",
-) -> tuple[torch.nn.Module, list[dict]]:
-    if metrics_history is None:
-        metrics_history = []
+                # --- scheduler step
+                if self.scheduler is not None and self.step_per_batch:
+                    self.scheduler.step()
 
-    beam_decoder = None
-    if ctc_decoder_type == "beam":
-        if tokenizer is None:
-            raise ValueError("Cannot build a beam search decoder without a tokenizer")
-        beam_decoder = build_beam_decoder(tokenizer)
+            running_loss += loss.item() * self.cfg.accum_steps
+            num_batches += 1
 
-    log = log_fn or make_log_fn(use_pbar)
+        if self.scheduler is not None and not self.step_per_batch:
+            self.scheduler.step()
 
-    epoch_iter = (
-        tqdm(range(1, epochs + 1), desc="Epochs") if use_pbar else range(1, epochs + 1)
-    )
+        avg_loss = running_loss / max(1, num_batches)
+        return {"loss": avg_loss}, debug_records
 
-    for epoch in epoch_iter:
-        if on_epoch_start:
-            on_epoch_start(epoch, model)
+    def _autocast(self) -> AbstractContextManager[Any]:
+        if not self.use_autocast:
+            return nullcontext()
+        return torch.autocast(device_type=self.device.type, enabled=True)
 
-        train_metrics = train_one_epoch(
-            model=model,
-            dataloader=train_loader,
-            optimizer=optimizer,
-            loss_fn=loss_fn,
-            device=device,
-            scaler=scaler,
-            scheduler=scheduler,
-            step_per_batch=step_per_batch,
-            grad_clip_norm=grad_clip_norm,
-            accum_steps=accum_steps,
-            use_pbar=use_pbar,
+    @torch.no_grad()
+    def _compute_blank_rate(
+        self,
+        logits: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> float:
+        pred = logits.argmax(dim=-1)  # [T,B]
+        T, B = pred.shape
+        t = torch.arange(T, device=pred.device).unsqueeze(1)  # [T,1]
+        mask = t < input_lengths.unsqueeze(0)  # [T,B]
+        blank = self.tokenizer.blank_index
+        return (pred[mask] == blank).float().mean().item()
+
+    @torch.no_grad()
+    def _param_checksum(self) -> float:
+        # cheap scalar fingerprint to detect sudden jumps/NaNs
+        s = 0.0
+        n = 0
+        for p in self.model.parameters():
+            if p.requires_grad:
+                x = p.detach()
+                # ignore tiny scalars; focus on larger tensors
+                if x.numel() >= 1024:
+                    s += x.float().mean().item()
+                    n += 1
+        return s / max(n, 1)
+
+    @torch.no_grad()
+    def _global_grad_norm(self) -> float:
+        sq = 0.0
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            if g.is_sparse:
+                g = g.coalesce().values()
+            g = g.float()
+            sq += g.pow(2).sum().item()
+        return math.sqrt(sq)
+
+    def evaluate(
+        self, dataloader: DataLoader, compute_error_rates: bool = False
+    ) -> dict[str, float]:
+        self.model.eval()
+        total_loss = 0.0
+        total_batches = 0
+        refs = []
+        hyps = []
+
+        iterator = (
+            tqdm(dataloader, desc="Eval", leave=False) if self.use_pbars else dataloader
         )
-        compute_metrics = epoch % full_eval_interval == 0
-        val_metrics = evaluate(
-            model=model,
-            dataloader=val_loader,
-            loss_fn=loss_fn,
-            device=device,
-            tokenizer=tokenizer,
-            beam_decoder=beam_decoder,
-            compute_metrics=compute_metrics,
-            print_samples=print_samples,
-            max_batches=max_batches,
-            use_pbar=use_pbar,
-            log_fn=log,
+
+        with torch.inference_mode():
+            for batch_id, batch in enumerate(iterator):
+                batch = batch.to(self.device)
+                input_lengths = self.model.output_lengths(batch.widths)
+
+                logits = self.model(batch.images)
+                loss = self.loss_fn(
+                    logits, batch.targets, input_lengths, batch.target_lengths
+                )
+                total_loss += float(loss.item())
+                total_batches += 1
+
+                if compute_error_rates:
+                    if self.ctc_decoder_mode is CTCDecoderMode.BEAM:
+                        decoded = beam_ctc_decode(
+                            logits, input_lengths, self.beam_decoder, self.tokenizer
+                        )
+                    else:
+                        decoded = greedy_ctc_decode(
+                            logits, input_lengths, self.tokenizer
+                        )
+                    refs.extend(batch.texts)
+                    hyps.extend(decoded)
+
+                    if self.cfg.checkpoint.print_samples > 0 and batch_id == 0:
+                        for i in range(
+                            min(self.cfg.checkpoint.print_samples, len(decoded))
+                        ):
+                            tqdm.write(
+                                f"[val sample {i}] pred: {decoded[i]!r} | gt: {batch.texts[i]!r}"
+                            )
+
+        avg_loss = total_loss / max(1, total_batches)
+        out = {"loss": avg_loss}
+        if compute_error_rates:
+            out["cer"] = cer(refs, hyps)
+            out["wer"] = wer(refs, hyps)
+        return out
+
+    def fit(
+        self,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        metrics_history: list[dict] | None = None,
+        on_epoch_start: Callable | None = None,
+    ) -> tuple[torch.nn.Module, list[dict]]:
+        if metrics_history is None:
+            metrics_history = []
+
+        epoch_iter = (
+            tqdm(range(1, self.cfg.epochs + 1), desc="Epochs")
+            if self.use_pbars
+            else range(1, self.cfg.epochs + 1)
         )
-        log(format_metrics(epoch, train_metrics, val_metrics, optimizer))
 
-        if checkpoint_manager is not None:
-            checkpoint_manager.maybe_save(
-                epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                val_metrics=val_metrics,
+        for epoch in epoch_iter:
+            if on_epoch_start:
+                on_epoch_start(epoch, self.model)
+
+            train_metrics, debug_records = self.train_one_epoch(epoch, train_loader)
+
+            compute_error_rates = (
+                self.cfg.checkpoint.compute_error_rates
+                and epoch % self.cfg.checkpoint.full_eval_interval == 0
             )
-            checkpoint_manager.save_last(
-                epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                val_metrics=val_metrics,
+            val_metrics = self.evaluate(val_loader, compute_error_rates)
+            tqdm.write(
+                format_metrics(epoch, train_metrics, val_metrics, self.optimizer)
             )
 
-        history_record: dict[str, Any] = {"epoch": epoch}
-        for k, v in train_metrics.items():
-            history_record[f"train_{k}"] = float(v)
-        for k, v in val_metrics.items():
-            history_record[f"val_{k}"] = float(v)
-        metrics_history.append(history_record)
+            if self.checkpoint_manager is not None:
+                save_kwargs = {
+                    "epoch": epoch,
+                    "model": self.model,
+                    "optimizer": self.optimizer,
+                    "scheduler": self.scheduler,
+                    "scaler": self.scaler,
+                    "val_metrics": val_metrics,
+                }
+                self.checkpoint_manager.maybe_save(**save_kwargs)
+                self.checkpoint_manager.save_last(**save_kwargs)
 
-    return model, metrics_history
+            history_record: dict[str, Any] = {"epoch": epoch}
+            history_record["lr"] = float(self.optimizer.param_groups[0].get("lr", 0.0))
+            for k, v in train_metrics.items():
+                history_record[f"train_{k}"] = float(v)
+            for k, v in val_metrics.items():
+                history_record[f"val_{k}"] = float(v)
+
+            metrics_history.append(history_record)
+
+            if self.checkpoint_manager is not None:
+                save_dir = Path(self.checkpoint_manager.save_dir)
+                _append_rows_to_csv(
+                    save_dir / "metrics.csv",
+                    list(history_record.keys()),
+                    [history_record],
+                )
+
+                if self.cfg.debug is DebugMode.LOG and len(debug_records) > 0:
+                    _append_rows_to_csv(
+                        save_dir / "debug.csv",
+                        list(debug_records[0].keys()),
+                        debug_records,
+                    )
+
+        return self.model, metrics_history
+
+
+def _should_skip_batch(input_lengths: torch.Tensor, current_epoch: int | None) -> bool:
+    if current_epoch is None:
+        return False
+    max_len = input_lengths.max().item()
+    if current_epoch < 10 and max_len > 250:
+        return True
+    if current_epoch < 30 and max_len > 350:
+        return True
+    return False
+
+
+def _append_rows_to_csv(
+    path: str | Path, fieldnames: list[str], rows: list[dict]
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+        f.flush()

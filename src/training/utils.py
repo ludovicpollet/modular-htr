@@ -2,15 +2,16 @@ import datetime
 import json
 import pathlib
 import random
-from dataclasses import dataclass, field, asdict
-from typing import Any, Callable, Literal
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable
 
 import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from src.data.tokenization import CharTokenizer
+from src import types
 from src.config import Config
+from src.data.tokenization import CharTokenizer
 
 
 def get_device() -> torch.device:
@@ -127,8 +128,8 @@ class CheckpointInfo:
 @dataclass(slots=True)
 class CheckpointManager:
     save_dir: str | pathlib.Path
-    monitor: str = "val_loss"
-    mode: Literal["min", "max"] = "min"
+    monitor: types.MonitorMetric | str = types.MonitorMetric.VAL_LOSS
+    mode: types.MetricMode | str = types.MetricMode.MIN
     top_k: int = 3
     best_checkpoints: list[CheckpointInfo] = field(default_factory=list)
     config: dict[str, Any] | None = None  # for backwards compatibility
@@ -139,6 +140,8 @@ class CheckpointManager:
         if isinstance(self.save_dir, str):
             self.save_dir = pathlib.Path(self.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.monitor = types.MonitorMetric(self.monitor).value
+        self.mode = types.MetricMode(self.mode).value
 
     def _is_better(self, score: float, ref: float) -> bool:
         return score < ref if self.mode == "min" else score > ref
@@ -214,3 +217,13 @@ class CheckpointManager:
         )
         torch.save(state, path)
         return path
+
+
+def log_model_info(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    msg = (
+        f"{model.__class__.__name__}: "
+        f"trainable={trainable / 1e6:.2f}M / total={total / 1e6:.2f}M"
+    )
+    tqdm.write(msg)
