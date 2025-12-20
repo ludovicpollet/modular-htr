@@ -1,13 +1,14 @@
 import math
 from abc import ABC, abstractmethod
 from typing import Literal, Self
+from dataclasses import asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.config import DropoutConfig
-from src.types import NormType, SequenceEncoderType, HeightCollapseMode
+from src.types import HeightCollapseMode, NormType, SequenceEncoderType
 
 
 def get_norm(norm_type: NormType | str, num_channels: int) -> nn.Module:
@@ -56,7 +57,12 @@ class ConvBlock(nn.Module):
 class ResidualBlock(nn.Module):
     """Pre-activation style residual block. Avoids inplace issues."""
 
-    def __init__(self, channels: int, norm_type: NormType | str = NormType.GROUP, dropout: float = 0.0):
+    def __init__(
+        self,
+        channels: int,
+        norm_type: NormType | str = NormType.GROUP,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.norm1 = get_norm(norm_type, channels)
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
@@ -71,7 +77,7 @@ class ResidualBlock(nn.Module):
         out = self.conv1(out)
         out = self.act(self.norm2(out))
         out = self.conv2(out)
-        out = self.dropout(self.conv2(out))
+        out = self.dropout(out)
         return out + identity
 
 
@@ -168,8 +174,10 @@ class HeightCollapse(nn.Module, ABC):
         """Collapse height dimension: [B, C, H, W] -> [B, C, W]"""
         pass
 
+
 class PoolHeightCollapse(HeightCollapse):
     """Collapse height via simple average pooling, no learnable params"""
+
     def __init__(self, mode: Literal["mean", "max"] = "mean"):
         super().__init__()
         self.mode = mode
@@ -180,6 +188,7 @@ class PoolHeightCollapse(HeightCollapse):
             return x.mean(dim=2)
         else:
             return x.max(dim=2).values
+
 
 class ConvHeightCollapse(HeightCollapse):
     """Collapse height via learned convolution."""
@@ -221,8 +230,7 @@ class ConvHeightCollapse(HeightCollapse):
 
 class AttentionHeightCollapse(HeightCollapse):
     """
-    Collapse height via attention. Useful for noisy/damaged documents
-    where relevant content may not span the full height.
+    Collapse height via attention. This is untested yet.
     """
 
     def __init__(self, channels: int, dropout: float = 0.0):
@@ -261,7 +269,13 @@ def create_height_collapse(
 class TemporalConvBlock(nn.Module):
     """1D convolutions over time dimension with residual connection."""
 
-    def __init__(self, channels: int, kernel_size: int = 3, num_layers: int = 2, dropout: float = 0.0):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 3,
+        num_layers: int = 2,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         layers = []
         for _ in range(num_layers):
@@ -292,7 +306,9 @@ class SequenceEncoder(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Encode sequence.
         Input: [B, C, T] (batch first, from CNN)
@@ -327,7 +343,9 @@ class LSTMEncoder(SequenceEncoder):
     def output_size(self) -> int:
         return 2 * self.hidden_size
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: [B, C, T] -> [T, B, C]
         seq = x.permute(2, 0, 1)
 
@@ -335,7 +353,9 @@ class LSTMEncoder(SequenceEncoder):
 
         if lengths is not None:
             lengths_cpu = lengths.detach().to("cpu", torch.int64, non_blocking=True)
-            packed = nn.utils.rnn.pack_padded_sequence(seq, lengths_cpu, enforce_sorted=False)
+            packed = nn.utils.rnn.pack_padded_sequence(
+                seq, lengths_cpu, enforce_sorted=False
+            )
             packed_out, _ = self.rnn(packed)
             out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, total_length=T)
         else:
@@ -370,6 +390,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 class TransformerEncoder(SequenceEncoder):
     """Transformer encoder with positional encoding."""
+
     _positions: torch.Tensor
 
     def __init__(
@@ -380,7 +401,7 @@ class TransformerEncoder(SequenceEncoder):
         dim_feedforward: int | None = None,
         dropout: float = 0.1,
         max_seq_len: int = 4096,
-        pos_encoding_dropout: float = 0.1
+        pos_encoding_dropout: float = 0.1,
     ):
         super().__init__()
         self._output_size = input_size
@@ -409,13 +430,16 @@ class TransformerEncoder(SequenceEncoder):
         self.register_buffer(
             "_positions",
             torch.arange(max_seq_len, dtype=torch.long),
-            persistent=False,)
+            persistent=False,
+        )
 
     @property
     def output_size(self) -> int:
         return self._output_size
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: [B, C, T] -> [B, T, C]
         seq = x.permute(0, 2, 1)
         B, T, C = seq.shape
@@ -424,7 +448,6 @@ class TransformerEncoder(SequenceEncoder):
         mask = None
         if lengths is not None:
             mask = self._positions[:T].unsqueeze(0) >= lengths.unsqueeze(1)
-
 
         seq = self.pos_encoding(seq)
         out = self.transformer(seq, src_key_padding_mask=mask)  # [B, T, C]
@@ -440,14 +463,18 @@ def create_sequence_encoder(
     pos_encoding_dropout: float | None = None,
     **kwargs,
 ) -> SequenceEncoder:
-    # coerce to enum type
-    SequenceEncoderType(type)
     """Factory for sequence encoders."""
+    # coerce to enum type
+    type = SequenceEncoderType(type)
     if type == SequenceEncoderType.LSTM:
         return LSTMEncoder(input_size, hidden_size, num_layers, dropout)
     elif type == SequenceEncoderType.TRANSFORMER:
         return TransformerEncoder(
-            input_size, num_layers=num_layers, dropout=dropout, pos_encoding_dropout=pos_encoding_dropout or dropout, **kwargs
+            input_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            pos_encoding_dropout=pos_encoding_dropout or dropout,
+            **kwargs,
         )
     raise ValueError(f"Unknown sequence encoder type: {type}")
 
@@ -455,9 +482,7 @@ def create_sequence_encoder(
 class HTRModel(nn.Module):
     """
     Modular CNN-RNN architecture for CTC-based text recognition.
-
-    Architecture:
-        CNN Backbone -> Height Collapse -> (Temporal Conv) -> Sequence Encoder -> FC
+    CNN Backbone -> Height Collapse -> (Temporal Conv) -> Sequence Encoder -> FC
     """
 
     def __init__(
@@ -465,15 +490,15 @@ class HTRModel(nn.Module):
         img_channels: int,
         num_classes: int,
         dropout: DropoutConfig,
-        backbone_channels: list[int] | None = None,
+        conv_channels: list[int] | None = None,
         pool_kernels: list[tuple[int, int]] | None = None,
         hidden_size: int = 384,
         num_layers: int = 3,
-        seq_encoder_type: SequenceEncoderType = SequenceEncoderType.LSTM,
+        seq_encoder: SequenceEncoderType = SequenceEncoderType.LSTM,
         norm_type: NormType = NormType.GROUP,
         height_collapse: HeightCollapseMode = HeightCollapseMode.MEAN,
-        use_temporal_conv: bool = True,
-        use_se: bool = False,
+        temporal_convolution: bool = True,
+        self_excitation: bool = False,
         input_height: int | None = None,
         channels_last: bool = False,
     ):
@@ -486,18 +511,19 @@ class HTRModel(nn.Module):
 
         # Store config
         self._config = {
+            "model_type":"HTRModel",
             "img_channels": img_channels,
             "num_classes": num_classes,
-            "backbone_channels": backbone_channels,
+            "conv_channels": conv_channels,
             "pool_kernels": pool_kernels,
             "hidden_size": hidden_size,
             "num_layers": num_layers,
-            "dropout": self.dropout_conf,
-            "seq_encoder_type": seq_encoder_type,
-            "norm_type": norm_type,
-            "height_collapse": height_collapse,
-            "use_temporal_conv": use_temporal_conv,
-            "use_se": use_se,
+            "dropout": asdict(self.dropout_conf),
+            "seq_encoder": seq_encoder.value,
+            "norm_type": norm_type.value,
+            "height_collapse": height_collapse.value,
+            "temporal_convolution": temporal_convolution,
+            "self_excitation": self_excitation,
             "input_height": input_height,
             "channels_last": channels_last,
         }
@@ -505,10 +531,10 @@ class HTRModel(nn.Module):
         # CNN backbone
         self.backbone = CNNBackbone(
             in_channels=img_channels,
-            stage_channels=backbone_channels,
+            stage_channels=conv_channels,
             pool_kernels=pool_kernels,
             norm_type=norm_type,
-            use_se=use_se,
+            use_se=self_excitation,
             spatial_dropout=self.dropout_conf.conv,
             residual_dropout=self.dropout_conf.residual,
         )
@@ -525,22 +551,27 @@ class HTRModel(nn.Module):
                 )
 
         self.height_collapse_layer = create_height_collapse(
-            height_collapse, feature_size, collapsed_height, dropout=self.dropout_conf.height_attention
+            height_collapse,
+            feature_size,
+            collapsed_height,
+            dropout=self.dropout_conf.height_attention,
         )
 
         # Temporal convolution
         self.temporal_conv_layer: TemporalConvBlock | None = None
-        if use_temporal_conv:
-            self.temporal_conv_layer = TemporalConvBlock(feature_size, dropout=self.dropout_conf.temporal)
+        if temporal_convolution:
+            self.temporal_conv_layer = TemporalConvBlock(
+                feature_size, dropout=self.dropout_conf.temporal
+            )
 
         # Sequence encoder
         self.seq_encoder = create_sequence_encoder(
-            type=seq_encoder_type,
+            type=seq_encoder,
             input_size=feature_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             dropout=self.dropout_conf.encoder,
-            pos_encoding_dropout = self.dropout_conf.pos_encoding,
+            pos_encoding_dropout=self.dropout_conf.pos_encoding,
         )
 
         # Output projection
@@ -556,6 +587,7 @@ class HTRModel(nn.Module):
         return widths // self.time_reduction
 
     def to(self, *args, **kwargs) -> Self:
+        """Override to apply channels last"""
         super().to(*args, **kwargs)
         if (
             self._channels_last
@@ -573,15 +605,13 @@ class HTRModel(nn.Module):
             if isinstance(module, (nn.Conv2d, nn.BatchNorm2d)):
                 module.to(memory_format=torch.channels_last)  # type: ignore (overload)
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Forward pass.
-
-        Args:
-            x: Input images [B, C, H, W]
-
-        Returns:
-            Logits [T, B, num_classes] for CTC loss
+        x: Input images [B, C, H, W]
+        Returns Logits [T, B, num_classes] for CTC loss
         """
         # Auto-convert input if channels last is enabled and on CUDA
         if self._channels_last and x.device.type == "cuda":
@@ -619,10 +649,29 @@ class HTRModel(nn.Module):
         return config
 
     @classmethod
-    def from_config(cls, config: dict) -> Self:
+    def from_config(cls, config: dict, *, num_classes: int, input_height: int | None = None) -> Self:
         """Create model from configuration dict."""
-        # Remove computed values that aren't constructor args
         config = config.copy()
+        saved_height = config.get("input_height")
+        if input_height is not None and saved_height is not None and input_height != saved_height:
+            config["input_height"] = input_height
+            print(f"[WARNING] Model was trained with input height {saved_height}; rebuilding with {input_height}.")
+        if input_height is not None:
+            config["input_height"] = input_height
+        elif saved_height is not None:
+            pass # already in
+        else:
+            raise ValueError("Missing input_height (needs to be passed if not stored).")
+
+        config["num_classes"] = num_classes
+        # Remove computed values that aren't constructor args
         config.pop("time_reduction", None)
         config.pop("height_reduction", None)
+        # rewrap enums if they're strings
+        config["seq_encoder"] = SequenceEncoderType(config["seq_encoder"])
+        config["norm_type"] = NormType(config["norm_type"])
+        config["height_collapse"] = HeightCollapseMode(config["height_collapse"])
+        # rebuild DropoutConfig if it's a dict
+        if isinstance(config.get("dropout"), dict):
+            config["dropout"] = DropoutConfig(**config["dropout"])
         return cls(**config)

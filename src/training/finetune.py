@@ -5,9 +5,12 @@ from dataclasses import dataclass
 
 import torch
 
+from .utils import log_model_info
 from src.data.tokenization import CharTokenizer, build_char_tokenizer
 from src.model.CRNN import CRNN
+from src.model.HTRModel import HTRModel
 from src.types import NewHeadInit, NewSymbolsInit
+import torch.nn as nn
 
 
 @dataclass
@@ -89,12 +92,12 @@ def build_head(
 
 
 def resize_output_layer(
-    model: CRNN,
+    model: CRNN | HTRModel,
     old_tok: CharTokenizer,
     new_tok: CharTokenizer,
     head_init: NewHeadInit,
     new_class_init: NewSymbolsInit,
-) -> CRNN:
+) -> CRNN | HTRModel:
     if len(old_tok) == len(new_tok) and head_init is NewHeadInit.COPY:
         return model
 
@@ -121,7 +124,7 @@ def prepare_finetune_model(
     override_config: dict[str, Any] | None = None,
     head_init: NewHeadInit | str = NewHeadInit.COPY,
     new_class_init: NewSymbolsInit | str = NewSymbolsInit.KAIMING,
-) -> tuple[CRNN, CharTokenizer, CharsetDiff]:
+) -> tuple[CRNN | HTRModel, CharTokenizer, CharsetDiff]:
     """High level convenience to build a model for finetuning from a checkpoint and handle alphabet differences"""
     # coerce eventual strings arguments to enum types
     head_init = NewHeadInit(head_init)
@@ -176,7 +179,7 @@ def restore_tokenizer_from_checkpoint(ckpt: dict[str, Any]) -> CharTokenizer | N
 
 def restore_model_from_checkpoint(
     checkpoint: dict[str, Any], device, override_config: dict[str, Any] | None = None
-) -> tuple[CRNN, CharTokenizer | None]:
+) -> tuple[CRNN | HTRModel, CharTokenizer | None]:
     model_cfg = checkpoint.get("model_config") or checkpoint["config"].get("model")
     if override_config is not None:
         model_cfg = override_config
@@ -189,36 +192,26 @@ def restore_model_from_checkpoint(
             "Warning: Checkpoint is missing a tokenizer. Will infer num_classes from model size."
         )
 
-    try:
-        conv_channels = model_cfg["conv_channels"]
-        pool_kernels = [tuple(k) for k in model_cfg["pool_kernels"]]
-        rnn_hidden = model_cfg["rnn_hidden"]
-        dropout = model_cfg["dropout"]
-        rnn_layers = model_cfg["rnn_layers"]
-        img_channels = model_cfg["img_channels"]
-    except KeyError as e:
-        raise ValueError(f"Checkpoint model config is missing key: {e.args[0]}") from e
-
     num_classes = len(tokenizer) if tokenizer else model_cfg.get("num_classes")
     if num_classes is None:
         raise ValueError(
             "Could not determine number of output classes to restore model."
         )
-
-    model = CRNN(
-        img_channels=img_channels,
-        num_classes=num_classes,
-        rnn_layers=rnn_layers,
-        conv_channels=conv_channels,
-        pool_kernels=pool_kernels,
-        rnn_hidden=rnn_hidden,
-        dropout=dropout,
-    )
-
+    model_cfg = dict(model_cfg) # copy to avoid mutating the checkpoint itself
+    model_type = model_cfg.pop("model_type", None)
+    if model_type is None:
+        raise ValueError("Missing model_type in checkpoint. Cannot rebuild.")
+    if model_type == "HTRModel":
+        model = HTRModel.from_config(model_cfg, num_classes = num_classes)
+    elif model_type == "crnn":
+        model = CRNN.from_config(model_cfg, num_classes = num_classes)
+    else:
+        raise NotImplementedError("Unknown model_type. Cannot rebuild.")
+    
     try:
         model.load_state_dict(checkpoint["model_state_dict"])
     except RuntimeError as e:
-        print("Could not load model")
+        print("Could not load model state dict")
         raise e
     model.to(device)
     model.eval()
@@ -229,7 +222,7 @@ def load_pretrained_model(
     checkpoint_path: str | Path,
     device: torch.device | str = "cpu",
     override_config: dict[str, Any] | None = None,
-) -> tuple[CRNN, CharTokenizer | None, dict[str, Any]]:
+) -> tuple[CRNN | HTRModel, CharTokenizer | None, dict[str, Any]]:
     checkpoint = load_checkpoint(checkpoint_path, map_location=device)
     model, tokenizer = restore_model_from_checkpoint(
         checkpoint, device, override_config
@@ -237,10 +230,30 @@ def load_pretrained_model(
     return model, tokenizer, checkpoint
 
 
-def freeze_cnn_stages(model: CRNN, num_stages: int) -> None:
-    for stage in list(model.cnn_stages[:num_stages]):
+def freeze_cnn_stages(model: CRNN | HTRModel, num_stages: int) -> None:
+    """
+    Freeze the first `num_stages` convolutional stages of the model.
+    Supports both the legacy CRNN (uses cnn_stages) and the new HTRModel
+    (uses backbone.stages).
+    """
+    log_model_info(model)
+    stages: list[nn.Module] | None = None
+    if hasattr(model, "cnn_stages"):
+        stages_attr = getattr(model, "cnn_stages")
+        if isinstance(stages_attr, (nn.ModuleList, list, tuple)):
+            stages = list(stages_attr)
+    if stages is None and hasattr(model, "backbone"):
+        backbone_stages = getattr(model.backbone, "stages", None)
+        if isinstance(backbone_stages, (nn.ModuleList, list, tuple)):
+            stages = list(backbone_stages)
+    if stages is None:
+        raise TypeError(f"Model of type {type(model)} has no CNN stages to freeze")
+
+    for stage in list(stages[:num_stages]):
         for p in stage.parameters():
             p.requires_grad = False
+    
+    log_model_info(model)
 
 
 def unfreeze_all(model: CRNN) -> None:
@@ -255,8 +268,20 @@ def make_unfreeze_callback(unfreeze_epoch, num_stages) -> Callable:
         if num_stages is None:
             unfreeze_all(model)
         else:
-            for stage in model.cnn_stages[:num_stages]:
+            stages: list[nn.Module] | None = None
+            if hasattr(model, "cnn_stages"):
+                stages_attr = getattr(model, "cnn_stages")
+                if isinstance(stages_attr, (nn.ModuleList, list, tuple)):
+                    stages = list(stages_attr)
+            if stages is None and hasattr(model, "backbone"):
+                backbone_stages = getattr(model.backbone, "stages", None)
+                if isinstance(backbone_stages, (nn.ModuleList, list, tuple)):
+                    stages = list(backbone_stages)
+            if stages is None:
+                raise TypeError(f"Model of type {type(model)} has no CNN stages to unfreeze")
+            for stage in stages[:num_stages]:
                 for p in stage.parameters():
                     p.requires_grad = True
+        log_model_info(model)
 
     return on_epoch_start

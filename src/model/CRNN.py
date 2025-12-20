@@ -1,5 +1,8 @@
+from typing import Self
+
 import torch
 import torch.nn as nn
+
 
 
 def conv_block(in_ch, out_ch, kernel_size=3, stride=1, padding=1):
@@ -85,7 +88,7 @@ class CRNN(nn.Module):
         """Map image widths (post preprocessing, in pixels) to sequence lengths (T) for CTC"""
         return widths // self.time_reduction
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         features = self.cnn(x)
         _B, _C, H, _W = features.size()
         assert H == 1
@@ -101,6 +104,7 @@ class CRNN(nn.Module):
     
     def to_config(self) -> dict:
         return {
+            "model_type": "crnn",
             "img_channels": self.img_channels,
             "num_classes": self.num_classes,
             "rnn_layers": self.rnn_layers,
@@ -110,3 +114,13 @@ class CRNN(nn.Module):
             "dropout": self.dropout_prob,
             "time_reduction": self.time_reduction,
         }
+    
+    @classmethod
+    def from_config(cls, config: dict, *, num_classes: int) -> Self:
+        cfg = dict(config)
+
+        cfg.pop("time_reduction", None)
+        cfg.pop("model_type", None)
+
+        cfg["num_classes"] = num_classes
+        return cls(**cfg)

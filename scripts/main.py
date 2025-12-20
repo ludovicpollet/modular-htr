@@ -1,4 +1,5 @@
 import math
+from dataclasses import asdict
 
 import torch
 import tyro
@@ -36,32 +37,9 @@ def build_model(
     cfg: src.config.Model, num_classes: int, input_height: int | None = None
 ) -> CRNN | HTRModel:
     if isinstance(cfg, src.config.CRNNConfig):
-        model = CRNN(
-            img_channels=cfg.img_channels,
-            num_classes=num_classes,
-            rnn_layers=cfg.rnn_layers,
-            rnn_hidden=cfg.rnn_hidden,
-            conv_channels=cfg.conv_channels,
-            dropout=cfg.dropout,
-        )
-        return model
+        return CRNN.from_config(asdict(cfg), num_classes=num_classes)
     if isinstance(cfg, src.config.ModelConfig):
-        model = HTRModel(
-            img_channels=cfg.img_channels,
-            num_classes=num_classes,
-            num_layers=cfg.num_layers,
-            hidden_size=cfg.hidden_size,
-            backbone_channels=cfg.conv_channels,
-            dropout=cfg.dropout,
-            seq_encoder_type=cfg.seq_encoder,
-            norm_type=cfg.norm_type,
-            use_temporal_conv=cfg.temporal_convolution,
-            input_height=input_height,
-            height_collapse=cfg.height_collapse,
-            use_se=True,
-            channels_last=True,
-        )
-        return model
+        return HTRModel.from_config(asdict(cfg), num_classes=num_classes, input_height=input_height)
     raise NotImplementedError(f"Unkown model type: {cfg.__class__.__name__}")
 
 

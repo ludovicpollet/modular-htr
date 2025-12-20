@@ -42,7 +42,7 @@ class Checkpoint:
     top_k: int = 3
     # Number of epochs between evals (those won't be considered for checkpointing).
     full_eval_interval: int = 1
-    # Number of samples to print after eval for visual inspection. Zero to disable. 
+    # Number of samples to print after eval for visual inspection. Zero to disable.
     print_samples: int = 0
 
 
@@ -60,16 +60,16 @@ class CTCDecoder:
 
 @dataclass
 class Trainer:
-    # Whether or not to use cuDNN benchmarking algorithms to speed up training. 
+    # Whether to use cuDNN benchmarking algorithms to speed up training.
     # Warning: considerably slows down the first epoch because of variable widths batches.
     # The training script will automatically try to mitigate by turning on binning of batch width to common multiples.
     torch_benchmark: bool = False
     # Number of times we step over the whole dataset.
-    epochs: int = 20
+    epochs: int = 40
     # Number of gradient accumulation steps before each optimizer update.
-    accum_steps: int = 1
+    accum_steps: int = 2
     # Maximum gradient norm for gradient clipping. Low values may help stabilize training.
-    grad_clip_norm: float = 5.0
+    grad_clip_norm: float = 2.0
     # Enables Automatic Mixed Precision [AMP] casting in chosen regions to improve performance; will also enable gradient scaling to improve convergence.
     # Setting to true might make CTC training brittle.
     amp: bool = False
@@ -107,13 +107,13 @@ class DropoutConfig:
     # Dropout2d after CNN stages (spatial dropout)
     conv: float = 0.1
     # Dropout2d inside ResidualBlocks
-    residual: float = 0.
+    residual: float = 0.1
     # Dropout in TemporalConvBlock
     temporal: float = 0.15
     # Dropout on attention weights in the height collapse
-    height_attention: float = 0.1
+    height_attention: float = 0.15
     # Dropout after position encoding
-    pos_encoding: float = 0.1
+    pos_encoding: float = 0.15
     # Sequence encoder dropout (between layers if LSTM, internal if Transfomer)
     encoder: float = 0.3
     # Dropout before final FC layer
@@ -126,11 +126,11 @@ class ModelConfig:
 
     # Outputs channels for each cnn stage (lenght determines number of stages).
     conv_channels: list[int] = field(
-        default_factory=lambda: [64, 128, 256, 384]
+        default_factory=lambda: [64, 128, 256, 384, 512]
     )
     # Pooling kernels (H, W) for each stage. Drives spatial reduction along height and time dimensions.
     pool_kernels: list[tuple[int, int]] = field(
-        default_factory=lambda: [(2, 2), (2, 2), (2, 1), (2, 1)]
+        default_factory=lambda: [(2, 2), (2, 2), (2, 2)]
     )
     # How to collapse height after CNN
     height_collapse: types.HeightCollapseMode = types.HeightCollapseMode.ATTENTION
@@ -153,10 +153,10 @@ class ModelConfig:
 @dataclass
 class OptimAdamwConfig:
     # Main learning rate selection. Will be used as max_lr for the schedulers.
-    lr: float = 6e-4
+    lr: float = 3e-4
     # Regularization param. Weight decay encourages learning simpler interpolations by pushing the weights gradually towards zero.
     # Mind its interaction with batch normalization.
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.1
 
 
 @dataclass
@@ -164,14 +164,14 @@ class Onecycle:
     # Annealing strategy for LR schedule
     anneal_strategy: types.AnnealStrategy = types.AnnealStrategy.COS
     # Fraction of total training where LR increases before annealing.
-    pct_start: float = 0.1
+    pct_start: float = 0.15
     # Initial LR = max_lr / div_factor.
-    div_factor: float = 10.0
+    div_factor: float = 25.0
     # Final LR = max_lr / final_div_factor.
-    final_div_factor: float = 10.0
+    final_div_factor: float = 10000.0
     # Update the LR every batch instead of every epoch.
     step_per_batch: tyro.conf.Fixed[bool] = True
-    
+
     # epochs must be inferred from the trainer config
     # max_lr must be inferred from optim config
 
@@ -207,13 +207,13 @@ type Config = Train | Finetune
 
 @dataclass
 class Train:
-    # Descriptive name that will be appended to the date and time to create the run directory. 
+    # Descriptive name that will be appended to the date and time to create the run directory.
     run_name: str
 
     data: Data
-    # The random seed for reproducible experiments. 
+    # The random seed for reproducible experiments.
     seed: int = 42
-    # Directory where training runs artifacts are stored 
+    # Directory where training runs artifacts are stored
     base_dir: str = "runs"
 
     model: Model = field(default_factory=CRNNConfig)
@@ -228,7 +228,7 @@ class Train:
 
 @dataclass
 class Finetune:
-    # Descriptive name that will be appended to the date and time to create the run directory. 
+    # Descriptive name that will be appended to the date and time to create the run directory.
     run_name: str
 
     data: Data
@@ -238,8 +238,8 @@ class Finetune:
     seed: int = 42
     # Directory where training runs artifacts are stored.
     base_dir: str = "runs"
-    
-    
+
+
     strategy: Strategy = field(default_factory=Strategy)
     optim: OptimAdamwConfig = field(default_factory=OptimAdamwConfig)
     # Choose a scheduler with its subcommand to see its relevant parameters and defaults.
@@ -256,4 +256,3 @@ if __name__ == "__main__":
     from pprint import pprint
     config = tyro.cli(Config, compact_help=True, config=(tyro.conf.CascadeSubcommandArgs, tyro.conf.FlagConversionOff,)) # type: ignore
     pprint(config)
-    
