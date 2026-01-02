@@ -6,27 +6,39 @@ import tyro
 
 from src import types
 
+
 @dataclass
-class Dataset:
-    # The name of the dataset.
-    name: str
-    # Path to a HuggingFace datasets.dataset.
+class LocalDataset:
+    # Path to a local HuggingFace datasets.dataset.
     path: Path
     # Name of the column that stores the labels.
     text_col: str = "text"
 
 
 @dataclass
+class HubDataset:
+    # The name (username/dataset) of a HuggingFace Hub dataset
+    name: str
+    # Name of the column that stores the labels.
+    text_col: str = "text"
+
+
+type Dataset = Annotated[LocalDataset, tyro.conf.subcommand("local")] | Annotated[HubDataset, tyro.conf.subcommand("hub")]
+
+
+@dataclass
 class Data:
     dataset: Dataset
     # Height of a line image after resize.
-    fixed_height: int = 48
+    fixed_height: int = 96
     # Number of workers to spawn for dataset processing AND dataloading.
     num_workers: int = 24
     # Training batch size.
     batch_size: int = 32
     # Bucket batches by width to avoid excessive padding.
     use_bucketing: bool = True
+    # Type of data augmentation to use.
+    augmentation: types.Augmentation = types.Augmentation.CPU
 
 
 @dataclass
@@ -65,11 +77,11 @@ class Trainer:
     # The training script will automatically try to mitigate by turning on binning of batch width to common multiples.
     torch_benchmark: bool = False
     # Number of times we step over the whole dataset.
-    epochs: int = 40
+    epochs: int = 20
     # Number of gradient accumulation steps before each optimizer update.
-    accum_steps: int = 2
+    accum_steps: int = 1
     # Maximum gradient norm for gradient clipping. Low values may help stabilize training.
-    grad_clip_norm: float = 2.0
+    grad_clip_norm: float = 5.0
     # Enables Automatic Mixed Precision [AMP] casting in chosen regions to improve performance; will also enable gradient scaling to improve convergence.
     # Setting to true might make CTC training brittle.
     amp: bool = False
@@ -113,7 +125,7 @@ class DropoutConfig:
     # Dropout on attention weights in the height collapse
     height_attention: float = 0.15
     # Dropout after position encoding
-    pos_encoding: float = 0.15
+    pos_encoding: float = 0.1
     # Sequence encoder dropout (between layers if LSTM, internal if Transfomer)
     encoder: float = 0.3
     # Dropout before final FC layer
@@ -126,24 +138,27 @@ class ModelConfig:
 
     # Outputs channels for each cnn stage (lenght determines number of stages).
     conv_channels: list[int] = field(
-        default_factory=lambda: [64, 128, 256, 384, 512]
+        default_factory=lambda: [32, 64, 128, 256, 512]
     )
     # Pooling kernels (H, W) for each stage. Drives spatial reduction along height and time dimensions.
     pool_kernels: list[tuple[int, int]] = field(
         default_factory=lambda: [(2, 2), (2, 2), (2, 2)]
     )
+    # Whether to use residual blocks in the cnn stages.
+    # Automatically uses bottleneck blocks for high channel count stages to save compute.
+    use_res_blocks: bool = True
     # How to collapse height after CNN
-    height_collapse: types.HeightCollapseMode = types.HeightCollapseMode.ATTENTION
+    height_collapse: types.HeightCollapseMode = types.HeightCollapseMode.MEAN
     # Add residual 1D convolutions over time before the seq encoder
-    temporal_convolution: bool = True
+    temporal_convolution: bool = False
     # Type of the sequence encoder block
     seq_encoder: types.SequenceEncoderType = types.SequenceEncoderType.TRANSFORMER
     # Number of recurrent layers stacked after the convolutional encoder.
-    num_layers: int = 4
+    num_layers: int = 3
     # Hidden size of the recurrent layers.
-    hidden_size: int = 384
+    hidden_size: int = 256
     # Whether to use self excitation
-    self_excitation: bool = True
+    self_excitation: bool = False
     # Dropout configuration
     dropout: DropoutConfig = field(default_factory=DropoutConfig)
     # Normalization type. Group is more stable for small batches.
@@ -153,10 +168,10 @@ class ModelConfig:
 @dataclass
 class OptimAdamwConfig:
     # Main learning rate selection. Will be used as max_lr for the schedulers.
-    lr: float = 3e-4
+    lr: float = 6e-4
     # Regularization param. Weight decay encourages learning simpler interpolations by pushing the weights gradually towards zero.
     # Mind its interaction with batch normalization.
-    weight_decay: float = 0.1
+    weight_decay: float = 0.005
 
 
 @dataclass
@@ -164,11 +179,11 @@ class Onecycle:
     # Annealing strategy for LR schedule
     anneal_strategy: types.AnnealStrategy = types.AnnealStrategy.COS
     # Fraction of total training where LR increases before annealing.
-    pct_start: float = 0.15
+    pct_start: float = 0.1
     # Initial LR = max_lr / div_factor.
-    div_factor: float = 25.0
+    div_factor: float = 10.0
     # Final LR = max_lr / final_div_factor.
-    final_div_factor: float = 10000.0
+    final_div_factor: float = 10.0
     # Update the LR every batch instead of every epoch.
     step_per_batch: tyro.conf.Fixed[bool] = True
 
@@ -179,7 +194,7 @@ class Onecycle:
 @dataclass
 class Cosine:
     # Minimum learning rate reached at the end of cosine schedule.
-    eta_min: float = 1e-5
+    eta_min: float = 5e-5
     # Update the LR every epoch.
     step_per_batch: tyro.conf.Fixed[bool] = False
     # max_T must be inferred from the trainer config

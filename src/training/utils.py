@@ -57,8 +57,12 @@ def make_log_fn(use_pbar: bool = True) -> Callable[[str], None]:
 def format_metrics(epoch, train_metrics, val_metrics, optimizer):
     parts = [f"Epoch {epoch:03d}"]
     parts.append(f"train_loss={train_metrics['loss']:.4f}")
-    parts.append(f"val_loss={val_metrics['loss']:.4f}")
+    if "loss_main" in train_metrics:
+        parts.append(f"train_loss_main={train_metrics['loss_main']:.4f}")
+    if "loss_shortcut" in train_metrics:
+        parts.append(f"train_loss_shortcut={train_metrics['loss_shortcut']:.4f}")
 
+    parts.append(f"val_loss={val_metrics['loss']:.4f}")
     if "cer" in val_metrics:
         parts.append(f"val_cer={val_metrics['cer']:.3f}")
     if "wer" in val_metrics:
@@ -116,6 +120,27 @@ def dump_config(run_dir: pathlib.Path, run_config: Config) -> None:
         )
     path = run_dir / "config.json"
     path.write_text(json.dumps(asdict(run_config), indent=2, default=str))
+
+
+class ScalarMeter:
+    """Helper to accumulate tensors on GPU and avoid per-step .item() sync issues."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.sum = torch.zeros((), device=device)
+        self.count = 0
+
+    def update(self, value: torch.Tensor, n: int = 1) -> None:
+        """Updates value (scalar Tensor) with .detach() to avoid autograd and sync"""
+        self.sum += value.detach()
+        self.count += n
+
+    def mean_tensor(self) -> torch.Tensor:
+        return self.sum / max(1, self.count)
+
+    def mean_float(self) -> float:
+        """Only to be called rarely."""
+        return float(self.mean_tensor().item())
 
 
 @dataclass(slots=True)

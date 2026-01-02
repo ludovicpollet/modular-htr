@@ -7,7 +7,7 @@ import datasets
 import torch
 
 from .transforms import make_basic_image_transform
-
+from src.types import Augmentation
 
 @dataclass(slots=True)
 class Batch:
@@ -22,8 +22,8 @@ class Batch:
         return Batch(
             images=self.images.to(device, non_blocking=True),
             targets=self.targets.to(device, non_blocking=True),
-            target_lengths=self.target_lengths.to(device, non_blocking=True),
-            widths=self.widths.to(device, non_blocking=True),
+            target_lengths=self.target_lengths,
+            widths=self.widths,
             ids=self.ids,
             texts=self.texts,
         )
@@ -61,8 +61,8 @@ def ctc_collate(batch) -> Batch:
     else:
         targets = torch.empty((0,), dtype=torch.long)
 
-    target_lengths = torch.as_tensor(target_lengths, dtype=torch.long)
-    widths_tensor = torch.as_tensor(widths, dtype=torch.long)
+    target_lengths = torch.as_tensor(target_lengths, dtype=torch.long, device="cpu")
+    widths_tensor = torch.as_tensor(widths, dtype=torch.long, device="cpu")
 
     batch_out = Batch(
         images=images_padded,  # [B, 1, H, W_max]
@@ -147,8 +147,10 @@ def make_dataloaders(
     batch_size: int = 32,
     num_workers: int = 16,
     use_bucketing: bool = True,
+    bin_bucket_widths: bool = False,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
+    augmentation: Augmentation = Augmentation.NONE,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """High level convenience to build DataLoaders from a HF DatasetDict"""
     if not isinstance(ds, datasets.DatasetDict):
@@ -159,11 +161,11 @@ def make_dataloaders(
         raise KeyError("DatasetDict must contain at least 'train' and 'test' splits.")
 
     ds = _ensure_widths(ds, fixed_height=fixed_height, num_proc=num_workers)
-    bucket_bin = 16 if torch.backends.cudnn.benchmark else None
+    bucket_bin = 64 if (torch.backends.cudnn.benchmark or bin_bucket_widths) else None
     widths_train = _bucket_widths(ds["train"]["width"], bin_size=bucket_bin)
 
     train_transform = make_basic_image_transform(
-        fixed_height=fixed_height, augment=True
+        fixed_height=fixed_height, augment=augmentation is Augmentation.CPU
     )
     test_transform = make_basic_image_transform(
         fixed_height=fixed_height, augment=False

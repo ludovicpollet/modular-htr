@@ -1,6 +1,12 @@
 import enum
 
 
+class Augmentation(str, enum.Enum):
+    CPU = "cpu"
+    GPU = "gpu"
+    NONE = "none"
+
+
 class NormType(str, enum.Enum):
     BATCH = "batch"
     GROUP = "group"

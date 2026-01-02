@@ -24,13 +24,6 @@ def get_norm(norm_type: NormType | str, num_channels: int) -> nn.Module:
     raise ValueError(f"Unknown norm_type '{norm_type}'")
 
 
-def convert_input_channels_last(x: torch.Tensor) -> torch.Tensor:
-    """Convert 4D input tensor to channels last if on CUDA"""
-    if x.device.type == "cuda" and x.ndim == 4:
-        return x.contiguous(memory_format=torch.channels_last)
-    return x
-
-
 class ConvBlock(nn.Module):
     """Conv -> Norm -> Activation block."""
 
@@ -80,6 +73,47 @@ class ResidualBlock(nn.Module):
         out = self.dropout(out)
         return out + identity
 
+class BottleneckResBlock(nn.Module):
+    """Bottleneck residual block to save compute when channel count is high"""
+
+    def __init__(
+        self,
+        channels: int,
+        reduction: int = 4,
+        norm_type: NormType | str = NormType.GROUP,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        mid = channels // reduction
+
+        self.norm1 = get_norm(norm_type, channels)
+        self.conv1 = nn.Conv2d(channels, mid, 1, bias = False)
+
+        self.norm2 = get_norm(norm_type, mid)
+        self.conv2 = nn.Conv2d(mid, mid, 3, padding=1, bias=False)
+
+        self.norm3 = get_norm(norm_type, mid)
+        self.conv3 = nn.Conv2d(mid, channels, 1, bias=False)
+
+        self.act = nn.LeakyReLU(0.01)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+
+        nn.init.zeros_(self.conv3.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        out = self.act(self.norm1(x))
+        out = self.conv1(out)
+
+        out = self.act(self.norm2(out))
+        out = self.conv2(out)
+
+        out = self.act(self.norm3(out))
+        out = self.conv3(out)
+
+        out = self.dropout(out)
+        return out + identity
 
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation block for channel attention."""
@@ -115,6 +149,7 @@ class CNNBackbone(nn.Module):
         stage_channels: list[int] | None = None,
         pool_kernels: list[tuple[int, int]] | None = None,
         norm_type: NormType | str = NormType.GROUP,
+        use_res_blocks: bool = True,
         use_se: bool = False,
         spatial_dropout: float = 0.0,
         residual_dropout: float = 0.0,
@@ -142,8 +177,12 @@ class CNNBackbone(nn.Module):
         for i, out_ch in enumerate(self.stage_channels):
             layers: list[nn.Module] = [
                 ConvBlock(in_ch, out_ch, norm_type=norm_type),
-                ResidualBlock(out_ch, norm_type=norm_type, dropout=residual_dropout),
             ]
+            if use_res_blocks and i > 2:
+                if out_ch >= 256:
+                    layers.append(BottleneckResBlock(out_ch, norm_type=norm_type, dropout=residual_dropout))
+                else:
+                    layers.append(ResidualBlock(out_ch, norm_type=norm_type, dropout=residual_dropout))
 
             if use_se:
                 layers.append(SEBlock(out_ch))
@@ -324,11 +363,13 @@ class LSTMEncoder(SequenceEncoder):
     def __init__(
         self,
         input_size: int,
-        hidden_size: int = 384,
-        num_layers: int = 3,
-        dropout: float = 0.3,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        pack_sequences: bool = True,
     ):
         super().__init__()
+        self.pack_sequences = pack_sequences
         self.hidden_size = hidden_size
         self.rnn = nn.LSTM(
             input_size=input_size,
@@ -351,10 +392,10 @@ class LSTMEncoder(SequenceEncoder):
 
         T, _B, _C = seq.shape
 
-        if lengths is not None:
-            lengths_cpu = lengths.detach().to("cpu", torch.int64, non_blocking=True)
+        if lengths is not None and self.pack_sequences:
+            # lengths should already be int 64 on CPU (from collate)
             packed = nn.utils.rnn.pack_padded_sequence(
-                seq, lengths_cpu, enforce_sorted=False
+                seq, lengths, enforce_sorted=True
             )
             packed_out, _ = self.rnn(packed)
             out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, total_length=T)
@@ -396,23 +437,38 @@ class TransformerEncoder(SequenceEncoder):
     def __init__(
         self,
         input_size: int,
-        num_layers: int = 3,
-        nhead: int = 8,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        pos_encoding_dropout: float,
+        nhead: int = 4,
         dim_feedforward: int | None = None,
-        dropout: float = 0.1,
         max_seq_len: int = 4096,
-        pos_encoding_dropout: float = 0.1,
     ):
         super().__init__()
-        self._output_size = input_size
-        dim_feedforward = dim_feedforward or 4 * input_size
+
+        if hidden_size % nhead != 0:
+                raise ValueError(
+                    f"hidden_size ({hidden_size}) must be divisible by nhead ({nhead}). "
+                    f"Try hidden_size={nhead * (hidden_size // nhead)} or nhead={hidden_size // (hidden_size // nhead)}"
+                )
+
+        # projection from last conv channels to hidden size
+
+        if input_size != hidden_size:
+                self.input_proj = nn.Linear(input_size, hidden_size)
+        else:
+            self.input_proj = nn.Identity()
+
+        self._output_size = hidden_size
+        dim_feedforward = dim_feedforward or 4 * hidden_size
 
         self.pos_encoding = SinusoidalPositionalEncoding(
-            input_size, max_len=max_seq_len, dropout=pos_encoding_dropout
+            hidden_size, max_len=max_seq_len, dropout=pos_encoding_dropout
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=input_size,
+            d_model=hidden_size,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
@@ -424,7 +480,7 @@ class TransformerEncoder(SequenceEncoder):
             encoder_layer,
             num_layers=num_layers,
             enable_nested_tensor=False,
-            norm=nn.LayerNorm(input_size),
+            norm=nn.LayerNorm(hidden_size),
         )
 
         self.register_buffer(
@@ -442,11 +498,14 @@ class TransformerEncoder(SequenceEncoder):
     ) -> torch.Tensor:
         # x: [B, C, T] -> [B, T, C]
         seq = x.permute(0, 2, 1)
-        B, T, C = seq.shape
+        seq = self.input_proj(seq)
+        _B, T, _C = seq.shape
 
         # create a padding mask (ignore position where True)
         mask = None
         if lengths is not None:
+            if lengths.device != seq.device:
+                lengths = lengths.to(seq.device, non_blocking=True)
             mask = self._positions[:T].unsqueeze(0) >= lengths.unsqueeze(1)
 
         seq = self.pos_encoding(seq)
@@ -457,10 +516,10 @@ class TransformerEncoder(SequenceEncoder):
 def create_sequence_encoder(
     type: SequenceEncoderType | str,
     input_size: int,
-    hidden_size: int = 384,
-    num_layers: int = 3,
-    dropout: float = 0.3,
-    pos_encoding_dropout: float | None = None,
+    hidden_size: int,
+    num_layers: int,
+    dropout: float,
+    pos_encoding_dropout: float,
     **kwargs,
 ) -> SequenceEncoder:
     """Factory for sequence encoders."""
@@ -471,9 +530,10 @@ def create_sequence_encoder(
     elif type == SequenceEncoderType.TRANSFORMER:
         return TransformerEncoder(
             input_size,
+            hidden_size,
             num_layers=num_layers,
             dropout=dropout,
-            pos_encoding_dropout=pos_encoding_dropout or dropout,
+            pos_encoding_dropout=pos_encoding_dropout,
             **kwargs,
         )
     raise ValueError(f"Unknown sequence encoder type: {type}")
@@ -492,6 +552,7 @@ class HTRModel(nn.Module):
         dropout: DropoutConfig,
         conv_channels: list[int] | None = None,
         pool_kernels: list[tuple[int, int]] | None = None,
+        use_res_blocks: bool = True,
         hidden_size: int = 384,
         num_layers: int = 3,
         seq_encoder: SequenceEncoderType = SequenceEncoderType.LSTM,
@@ -500,13 +561,9 @@ class HTRModel(nn.Module):
         temporal_convolution: bool = True,
         self_excitation: bool = False,
         input_height: int | None = None,
-        channels_last: bool = False,
+        shortcut_ctc: bool = True,
     ):
         super().__init__()
-
-        self._channels_last = channels_last
-        self._channels_last_applied = False
-
         self.dropout_conf = dropout
 
         # Store config
@@ -516,6 +573,7 @@ class HTRModel(nn.Module):
             "num_classes": num_classes,
             "conv_channels": conv_channels,
             "pool_kernels": pool_kernels,
+            "use_res_blocks": use_res_blocks,
             "hidden_size": hidden_size,
             "num_layers": num_layers,
             "dropout": asdict(self.dropout_conf),
@@ -525,7 +583,7 @@ class HTRModel(nn.Module):
             "temporal_convolution": temporal_convolution,
             "self_excitation": self_excitation,
             "input_height": input_height,
-            "channels_last": channels_last,
+            "shortcut_ctc": shortcut_ctc,
         }
 
         # CNN backbone
@@ -533,6 +591,7 @@ class HTRModel(nn.Module):
             in_channels=img_channels,
             stage_channels=conv_channels,
             pool_kernels=pool_kernels,
+            use_res_blocks=use_res_blocks,
             norm_type=norm_type,
             use_se=self_excitation,
             spatial_dropout=self.dropout_conf.conv,
@@ -556,6 +615,9 @@ class HTRModel(nn.Module):
             collapsed_height,
             dropout=self.dropout_conf.height_attention,
         )
+
+        if shortcut_ctc:
+            self.shortcut_head = nn.Conv1d(feature_size, num_classes, kernel_size=3, padding=1)
 
         # Temporal convolution
         self.temporal_conv_layer: TemporalConvBlock | None = None
@@ -584,44 +646,29 @@ class HTRModel(nn.Module):
 
     def output_lengths(self, widths: torch.Tensor) -> torch.Tensor:
         """Map input widths (pixels) to output sequence lengths for CTC."""
-        return widths // self.time_reduction
+        lengths = widths.to(dtype=torch.int64)
+        for _, k_w in self.backbone.pool_kernels:
+            lengths = lengths // k_w
+        return lengths
 
-    def to(self, *args, **kwargs) -> Self:
-        """Override to apply channels last"""
-        super().to(*args, **kwargs)
-        if (
-            self._channels_last
-            and not self._channels_last_applied
-            and list(self.parameters())
-            and next(self.parameters()).device.type == "cuda"
-        ):
-            self._apply_channels_last()
-            self._channels_last_applied = True
-        return self
-
-    def _apply_channels_last(self) -> None:
-        """Convert 2D conv layers to channels_last format."""
-        for module in self.modules():
-            if isinstance(module, (nn.Conv2d, nn.BatchNorm2d)):
-                module.to(memory_format=torch.channels_last)  # type: ignore (overload)
 
     def forward(
         self, x: torch.Tensor, lengths: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
-        Forward pass.
         x: Input images [B, C, H, W]
-        Returns Logits [T, B, num_classes] for CTC loss
+        Returns Logits [T, B, num_classes] for CTC loss, Logits [same] for shortcut CTC loss
         """
-        # Auto-convert input if channels last is enabled and on CUDA
-        if self._channels_last and x.device.type == "cuda":
-            x = convert_input_channels_last(x)
-
         # CNN features: [B, C, H, W] -> [B, Cf, Hc, Wc]
         features = self.backbone(x)
 
         # Height collapse: [B, Cf, Hc, Wc] -> [B, Cf, Wc]
         features = self.height_collapse_layer(features)
+
+        shortcut_logits = None
+        if hasattr(self, 'shortcut_head'):
+                   shortcut_logits = self.shortcut_head(features)
+                   shortcut_logits = shortcut_logits.permute(2, 0, 1)
 
         # Temporal conv: [B, Cf, T]
         if self.temporal_conv_layer is not None:
@@ -629,7 +676,8 @@ class HTRModel(nn.Module):
 
         seq_lengths = None
         if lengths is not None:
-            seq_lengths = self.output_lengths(lengths)
+            actual_T = features.size(-1)
+            seq_lengths = self.output_lengths(lengths).clamp(min=1, max=actual_T)
 
         # Sequence encoding: [B, Cf, T] -> [T, B, D]
         seq_out = self.seq_encoder(features, seq_lengths)
@@ -638,7 +686,7 @@ class HTRModel(nn.Module):
         seq_out = self.dropout_layer(seq_out)
         logits = self.fc(seq_out)
 
-        return logits
+        return logits, shortcut_logits
 
     def to_config(self) -> dict:
         """Export configuration for serialization."""

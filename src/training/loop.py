@@ -10,13 +10,14 @@ from tqdm.auto import tqdm
 
 from src.config import Trainer as TrainerConfig
 from src.data.tokenization import CharTokenizer
+from src.data.transforms import GPUAugmentation
 from src.model.CRNN import CRNN
 from src.model.HTRModel import HTRModel
-from src.types import CTCDecoderMode, DebugMode
+from src.types import Augmentation, CTCDecoderMode, DebugMode
 
 from .ctc import CTCLossWrapper, beam_ctc_decode, build_beam_decoder, greedy_ctc_decode
 from .metrics import cer, wer
-from .utils import CheckpointManager, format_metrics
+from .utils import CheckpointManager, ScalarMeter, format_metrics
 
 type Model = CRNN | HTRModel
 
@@ -34,6 +35,7 @@ class Trainer:
         step_per_batch: bool = False,
         ctc_decoder_mode: CTCDecoderMode | str = CTCDecoderMode.GREEDY,
         checkpoint_manager: CheckpointManager | None = None,
+        augmentation: Augmentation = Augmentation.NONE,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -64,10 +66,16 @@ class Trainer:
                 )
             self.beam_decoder = build_beam_decoder(self.tokenizer)
 
+        self.augment = augmentation is Augmentation.GPU
+        if self.augment:
+            self.aug_module = GPUAugmentation(self.device)
+
     def train_one_epoch(self, current_epoch: int, dataloader: DataLoader):
-        running_loss = 0.0
-        num_batches = 0
+        running_loss = ScalarMeter(self.device)
+        running_loss_main = ScalarMeter(self.device)
+        running_loss_shortcut = ScalarMeter(self.device)
         debug_records: list[dict[str, Any]] = []
+        shortcut_ctc = False
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -81,10 +89,18 @@ class Trainer:
             batch = batch.to(self.device)
             input_lengths = self.model.output_lengths(batch.widths)
 
+            images = batch.images
+            images = images.contiguous()
+            # augment on gpu for the more expensive operations
+            if self.augment:
+                images = self.aug_module(images)
+
+            # images = images.contiguous(memory_format=torch.channels_last)
+
             # --- forward pass ---
             blank_rate = None
             with self._autocast():
-                logits = self.model(batch.images, batch.widths)
+                logits, shortcut_logits = self.model(images, batch.widths)
                 T = int(logits.size(0))
                 B = int(logits.size(1))
 
@@ -92,10 +108,25 @@ class Trainer:
                     blank_rate = self._compute_blank_rate(logits, input_lengths)
 
                 # --- compute loss---
-                loss = self.loss_fn(
+                loss_main = self.loss_fn(
                     logits, batch.targets, input_lengths, batch.target_lengths
                 )
-                loss = loss / self.cfg.accum_steps
+                loss_total = loss_main
+                if shortcut_logits is not None:
+                    shortcut_ctc = True
+                    shortcut_loss = self.loss_fn(
+                        shortcut_logits,
+                        batch.targets,
+                        input_lengths,
+                        batch.target_lengths,
+                    )
+                    loss_total = loss_main + shortcut_loss
+                    running_loss_main.update(loss_main)
+                    running_loss_shortcut.update(shortcut_loss)
+                running_loss.update(loss_total)
+
+                # scale total loss only for backprop
+                loss = loss_total / self.cfg.accum_steps
 
             # --- backward pass ---
             if self.scaler is not None:
@@ -186,14 +217,15 @@ class Trainer:
                 if self.scheduler is not None and self.step_per_batch:
                     self.scheduler.step()
 
-            running_loss += loss.item() * self.cfg.accum_steps
-            num_batches += 1
-
         if self.scheduler is not None and not self.step_per_batch:
             self.scheduler.step()
 
-        avg_loss = running_loss / max(1, num_batches)
-        return {"loss": avg_loss}, debug_records
+        metrics = {"loss": running_loss.mean_float()}
+        if shortcut_ctc:
+            metrics["loss_main"] = running_loss_main.mean_float()
+            metrics["loss_shortcut"] = running_loss_shortcut.mean_float()
+
+        return metrics, debug_records
 
     def _autocast(self) -> AbstractContextManager[Any]:
         if not self.use_autocast:
@@ -244,8 +276,7 @@ class Trainer:
         self, dataloader: DataLoader, compute_error_rates: bool = False
     ) -> dict[str, float]:
         self.model.eval()
-        total_loss = 0.0
-        total_batches = 0
+        loss_meter = ScalarMeter(self.device)
         refs = []
         hyps = []
 
@@ -258,12 +289,11 @@ class Trainer:
                 batch = batch.to(self.device)
                 input_lengths = self.model.output_lengths(batch.widths)
 
-                logits = self.model(batch.images)
+                logits, _ = self.model(batch.images)
                 loss = self.loss_fn(
                     logits, batch.targets, input_lengths, batch.target_lengths
                 )
-                total_loss += float(loss.item())
-                total_batches += 1
+                loss_meter.update(loss)
 
                 if compute_error_rates:
                     if self.ctc_decoder_mode is CTCDecoderMode.BEAM:
@@ -285,8 +315,7 @@ class Trainer:
                                 f"[val sample {i}] pred: {decoded[i]!r} | gt: {batch.texts[i]!r}"
                             )
 
-        avg_loss = total_loss / max(1, total_batches)
-        out = {"loss": avg_loss}
+        out = {"loss": loss_meter.mean_float()}
         if compute_error_rates:
             out["cer"] = cer(refs, hyps)
             out["wer"] = wer(refs, hyps)

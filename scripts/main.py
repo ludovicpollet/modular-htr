@@ -1,9 +1,10 @@
 import math
 from dataclasses import asdict
+from typing import cast
 
 import torch
 import tyro
-from datasets import load_from_disk
+from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 
 import src.config
 from src.data.dataloaders import make_dataloaders
@@ -33,13 +34,24 @@ type Scheduler = (
 )
 
 
+def get_dataset(cfg: src.config.Dataset) -> Dataset | DatasetDict:
+    if isinstance(cfg, src.config.LocalDataset):
+        return load_from_disk(cfg.path)
+    if isinstance(cfg, src.config.HubDataset):
+        # casting to avoid the iterable return types variant
+        # to do later, maybe support streaming
+        return cast(Dataset | DatasetDict, load_dataset(cfg.name, streaming=False))
+
+
 def build_model(
     cfg: src.config.Model, num_classes: int, input_height: int | None = None
 ) -> CRNN | HTRModel:
     if isinstance(cfg, src.config.CRNNConfig):
         return CRNN.from_config(asdict(cfg), num_classes=num_classes)
     if isinstance(cfg, src.config.ModelConfig):
-        return HTRModel.from_config(asdict(cfg), num_classes=num_classes, input_height=input_height)
+        return HTRModel.from_config(
+            asdict(cfg), num_classes=num_classes, input_height=input_height
+        )
     raise NotImplementedError(f"Unkown model type: {cfg.__class__.__name__}")
 
 
@@ -91,7 +103,7 @@ def run_training(cfg: src.config.Train) -> None:
     configure_torch(benchmark=cfg.trainer.torch_benchmark)
     device = get_device()
 
-    ds = load_from_disk(cfg.data.dataset.path)
+    ds = get_dataset(cfg.data.dataset)
     text_col = cfg.data.dataset.text_col
     tokenizer = build_char_tokenizer(ds, text_col)
     ds = apply_ctc_tokenizer(ds, tokenizer, text_col)
@@ -102,7 +114,9 @@ def run_training(cfg: src.config.Train) -> None:
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         use_bucketing=cfg.data.use_bucketing,
+        bin_bucket_widths=False,
         pin_memory=device.type != "cpu",
+        augmentation=cfg.data.augmentation,
     )
 
     model = build_model(
@@ -110,6 +124,8 @@ def run_training(cfg: src.config.Train) -> None:
     )
     log_model_info(model)
     model.to(device)
+    # model = model.to(memory_format=torch.channels_last)
+    # model.backbone = torch.compile(model.backbone, dynamic=True)
 
     epochs = cfg.trainer.epochs
     loss_fn = CTCLossWrapper(blank=tokenizer.blank_index)
@@ -148,6 +164,7 @@ def run_training(cfg: src.config.Train) -> None:
         step_per_batch=step_per_batch,
         ctc_decoder_mode=cfg.decoder.mode,
         checkpoint_manager=checkpoint_manager,
+        augmentation=cfg.data.augmentation,
     )
 
     model, _metrics_history = trainer.fit(train_loader, val_loader)
@@ -158,7 +175,7 @@ def run_finetune(cfg: src.config.Finetune) -> None:
     configure_torch(benchmark=cfg.trainer.torch_benchmark)
     device = get_device()
 
-    finetune_ds = load_from_disk(cfg.data.dataset.path)
+    finetune_ds = get_dataset(cfg.data.dataset)
 
     model, merged_tokenizer, _charset_diff = prepare_finetune_model(
         checkpoint_path=cfg.from_checkpoint,
