@@ -41,7 +41,7 @@ class ConvBlock(nn.Module):
             in_channels, out_channels, kernel_size, stride, padding, bias=False
         )
         self.norm = get_norm(norm_type, out_channels)
-        self.act = nn.LeakyReLU(negative_slope=0.01)
+        self.act = nn.GELU() if out_channels >= 128 else nn.LeakyReLU(negative_slope=0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.norm(self.conv(x)))
@@ -61,7 +61,7 @@ class ResidualBlock(nn.Module):
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.norm2 = get_norm(norm_type, channels)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.act = nn.LeakyReLU(negative_slope=0.01)
+        self.act = nn.GELU()
         self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -95,7 +95,7 @@ class BottleneckResBlock(nn.Module):
         self.norm3 = get_norm(norm_type, mid)
         self.conv3 = nn.Conv2d(mid, channels, 1, bias=False)
 
-        self.act = nn.LeakyReLU(0.01)
+        self.act = nn.GELU()
         self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
         nn.init.zeros_(self.conv3.weight)
@@ -139,8 +139,7 @@ class SEBlock(nn.Module):
 class CNNBackbone(nn.Module):
     """
     CNN feature extractor with configurable stages.
-
-    Each stage: ConvBlock -> ResidualBlock -> (optional SE) -> (optional Pool)
+    Each stage: ConvBlock -> (ResidualBlock) -> (SE) -> (Pool)
     """
 
     def __init__(
@@ -215,7 +214,7 @@ class HeightCollapse(nn.Module, ABC):
 
 
 class PoolHeightCollapse(HeightCollapse):
-    """Collapse height via simple average pooling, no learnable params"""
+    """Collapse height via simple pooling, no learnable params."""
 
     def __init__(self, mode: Literal["mean", "max"] = "mean"):
         super().__init__()
@@ -269,7 +268,7 @@ class ConvHeightCollapse(HeightCollapse):
 
 class AttentionHeightCollapse(HeightCollapse):
     """
-    Collapse height via attention. This is untested yet.
+    Collapse height via attention.
     """
 
     def __init__(self, channels: int, dropout: float = 0.0):
@@ -280,8 +279,8 @@ class AttentionHeightCollapse(HeightCollapse):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, H, W]
         attn = self.query(x)  # [B, 1, H, W]
-        attn = F.softmax(attn, dim=2)  # Normalize over height
         attn = self.dropout(attn)
+        attn = F.softmax(attn / 1.3, dim=2)  # Normalize over height
         out = (x * attn).sum(dim=2)  # [B, C, W]
         return out
 
@@ -542,7 +541,7 @@ def create_sequence_encoder(
 class HTRModel(nn.Module):
     """
     Modular CNN-RNN architecture for CTC-based text recognition.
-    CNN Backbone -> Height Collapse -> (Temporal Conv) -> Sequence Encoder -> FC
+    CNN Backbone -> Height Collapse -> (CTC Shortcut) - > (Temporal Conv) -> Sequence Encoder -> FC
     """
 
     def __init__(
