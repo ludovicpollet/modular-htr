@@ -1,14 +1,15 @@
 import math
 from dataclasses import asdict
-from typing import cast
 
 import torch
 import tyro
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from torchinfo import summary
 
 import src.config
 from src.data.dataloaders import make_dataloaders
 from src.data.tokenization import apply_ctc_tokenizer, build_char_tokenizer
+from src.data.hf_dataset import build_hf_dataset
+from src.data.analysis import run_analysis
 from src.model.CRNN import CRNN
 from src.model.HTRModel import HTRModel
 from src.training.ctc import CTCLossWrapper
@@ -22,6 +23,7 @@ from src.training.utils import (
     CheckpointManager,
     configure_torch,
     create_run_dir,
+    get_dataset,
     dump_config,
     get_device,
     log_model_info,
@@ -32,15 +34,6 @@ from src.types import MonitorMetric
 type Scheduler = (
     torch.optim.lr_scheduler.OneCycleLR | torch.optim.lr_scheduler.CosineAnnealingLR
 )
-
-
-def get_dataset(cfg: src.config.Dataset) -> Dataset | DatasetDict:
-    if isinstance(cfg, src.config.LocalDataset):
-        return load_from_disk(cfg.path)
-    if isinstance(cfg, src.config.HubDataset):
-        # casting to avoid the iterable return types variant
-        # to do later, maybe support streaming
-        return cast(Dataset | DatasetDict, load_dataset(cfg.name, streaming=False))
 
 
 def build_model(
@@ -106,10 +99,12 @@ def run_training(cfg: src.config.Train) -> None:
     ds = get_dataset(cfg.data.dataset)
     text_col = cfg.data.dataset.text_col
     tokenizer = build_char_tokenizer(ds, text_col)
-    ds = apply_ctc_tokenizer(ds, tokenizer, text_col)
 
     train_loader, val_loader = make_dataloaders(
         ds,  # type: ignore (should be duck-type compatible)
+        tokenizer=tokenizer,
+        text_col=text_col,
+        filter_config=cfg.data.width_filters,
         fixed_height=cfg.data.fixed_height,
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
@@ -123,8 +118,15 @@ def run_training(cfg: src.config.Train) -> None:
         cfg.model, num_classes=len(tokenizer), input_height=cfg.data.fixed_height
     )
     log_model_info(model)
+    model_summary = summary(
+        model,
+        input_size=(cfg.data.batch_size, 1, cfg.data.fixed_height, 1000),
+        col_names=("output_size", "num_params", "kernel_size", "mult_adds"),
+        depth=5,
+    )
     model.to(device)
-    # model = model.to(memory_format=torch.channels_last)
+    if cfg.trainer.channels_last:
+        model = model.to(memory_format=torch.channels_last)  # type: ignore
     # model.backbone = torch.compile(model.backbone, dynamic=True)
 
     epochs = cfg.trainer.epochs
@@ -138,6 +140,8 @@ def run_training(cfg: src.config.Train) -> None:
     step_per_batch = cfg.scheduler.step_per_batch
 
     run_dir = create_run_dir(cfg.base_dir, cfg.run_name)
+    with open(f"{run_dir}/model_summary.txt", "w") as f:
+        f.write(str(model_summary))
     dump_config(run_dir, cfg)
 
     if cfg.trainer.checkpoint.compute_error_rates:
@@ -185,12 +189,16 @@ def run_finetune(cfg: src.config.Finetune) -> None:
         head_init=cfg.strategy.head_init_mode,
         new_class_init=cfg.strategy.new_symbols_init,
     )
+    if cfg.trainer.channels_last:
+        model = model.to(memory_format=torch.channels_last)  # type: ignore
 
     tokenizer = merged_tokenizer
     finetune_ds = apply_ctc_tokenizer(finetune_ds, tokenizer, cfg.data.dataset.text_col)
 
     train_loader, val_loader = make_dataloaders(
         finetune_ds,  # type: ignore (should be duck-type compatible)
+        filter_config=cfg.data.width_filters,
+        tokenizer=tokenizer,
         fixed_height=cfg.data.fixed_height,
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
@@ -246,6 +254,10 @@ def run_finetune(cfg: src.config.Finetune) -> None:
     )
 
 
+def run_ds_compile(cfg: src.config.CompileDataset):
+    build_hf_dataset(cfg.xml_path, cfg.img_path, cfg.out_path)
+
+
 def main():
     cfg = tyro.cli(
         src.config.Config,  # type: ignore (tyro doesn't get the type alias)
@@ -259,6 +271,10 @@ def main():
         run_training(cfg)
     elif isinstance(cfg, src.config.Finetune):
         run_finetune(cfg)
+    elif isinstance(cfg, src.config.CompileDataset):
+        run_ds_compile(cfg)
+    elif isinstance(cfg, src.config.AnalyseDataset):
+        run_analysis(cfg)
     else:
         print("Don't know what to do.")
 

@@ -3,11 +3,14 @@ import random
 import os
 from dataclasses import dataclass
 
+import numpy as np
 import datasets
 import torch
 
-from .transforms import make_basic_image_transform
+from .transforms import make_preprocessing_fn, make_runtime_transform
+from .tokenization import CharTokenizer
 from src.types import Augmentation
+from src.config import WidthFilters
 
 @dataclass(slots=True)
 class Batch:
@@ -119,6 +122,7 @@ def _ensure_widths(ds, fixed_height, num_proc=None):
                 batched=True,
                 batch_size=1024,
                 num_proc=num_proc,
+                desc=(f"Getting widths for height {fixed_height} in split 'train'")
             ),
             "test": ds["test"].map(
                 _compute_resized_width,
@@ -126,6 +130,7 @@ def _ensure_widths(ds, fixed_height, num_proc=None):
                 batched=True,
                 batch_size=1024,
                 num_proc=num_proc,
+                desc=(f"Getting widths for height {fixed_height} in split 'test'")
             ),
         }
     )
@@ -141,8 +146,109 @@ def _bucket_widths(widths, bin_size: int | None):
     return [math.ceil(w / bin_size) * bin_size for w in widths]
 
 
+def _apply_size_filter(
+    ds: datasets.Dataset,
+    config: WidthFilters,
+    split_name: str = "train",
+) -> datasets.Dataset:
+    """
+    Filter overly large images for memory efficiency.
+    Will remove those batches that come from hell with huge memory impact and potentially a lot of padding.
+    Applied once during dataset preparation.
+    """
+    if not config.filter_large_images:
+        return ds
+
+    widths = np.array(ds["width"])
+    percentile_threshold = np.percentile(widths, config.width_percentile)
+    max_width = config.max_width if config.max_width else percentile_threshold
+
+    original_len = len(ds)
+    ds = ds.filter(
+        lambda example: example["width"] <= max_width,
+        desc=f"Filtering large images for memory efficiency ({split_name})",
+    )
+    diff = original_len - len(ds)
+    print(f"[{split_name}] Size filter: {original_len} → {len(ds)}")
+    if diff > 0:
+        print(f"(Removed {diff}, threshold={max_width:.0f}px)")
+    else:
+        print("Nothing to remove.")
+
+    return ds
+
+
+def _apply_ctc_filter(
+    ds: datasets.Dataset,
+    config: WidthFilters,
+    split_name: str = "train",
+) -> datasets.Dataset:
+    """
+    Filter samples that don't meet CTC requirement.
+    Requirement is set like in the analysis script: T >= margin * T_req, where T_req = 2*L - 1
+    """
+    if not config.enforce_ctc_width:
+        return ds
+
+    def meets_ctc_requirement(example) -> bool:
+        text_len = len(example["text"])
+        if text_len == 0:
+            return False
+
+        timesteps = example["width"] // config.time_reduction_factor
+
+        return timesteps >= config.ctc_margin * text_len
+
+    original_len = len(ds)
+    ds = ds.filter(meets_ctc_requirement, desc=f"CTC filter ({split_name})")
+
+    diff = original_len - len(ds)
+    print(f"[{split_name}] CTC filter: {original_len} → {len(ds)}")
+    print(f"stride={config.time_reduction_factor}, margin={config.ctc_margin})")
+    if diff > 0:
+          print(f"(removed {diff})")
+    else:
+        print("Nothing to remove.")
+    return ds
+
+
+def _preprocess_split(
+    ds: datasets.Dataset,
+    fixed_height: int,
+    tokenizer: CharTokenizer,
+    text_col: str,
+    filter_config: WidthFilters,
+    split_name: str,
+    num_proc: int,
+) -> datasets.Dataset:
+    """
+    Single preprocessing pass then apply filters
+    (grayscale) -> resize -> tokenize -> filters
+    Cached by HF datasets.
+    """
+    preprocess_fn = make_preprocessing_fn(
+        fixed_height=fixed_height,
+        tokenizer=tokenizer,
+        text_col=text_col,
+    )
+
+    ds = ds.map(
+        preprocess_fn,
+        num_proc=num_proc,
+        desc=f"Preprocessing {split_name}",
+        load_from_cache_file=True,
+    )
+
+    ds = _apply_size_filter(ds, filter_config, split_name)
+    ds = _apply_ctc_filter(ds, filter_config, split_name)
+
+    return ds
+
 def make_dataloaders(
     ds: datasets.DatasetDict,
+    filter_config: WidthFilters,
+    tokenizer: CharTokenizer,
+    text_col: str = "text",
     fixed_height: int = 96,
     batch_size: int = 32,
     num_workers: int = 16,
@@ -160,16 +266,21 @@ def make_dataloaders(
     if "train" not in ds or "test" not in ds:
         raise KeyError("DatasetDict must contain at least 'train' and 'test' splits.")
 
-    ds = _ensure_widths(ds, fixed_height=fixed_height, num_proc=num_workers)
+
+    ds = datasets.DatasetDict({
+        "train": _preprocess_split(ds["train"], fixed_height, tokenizer, text_col, filter_config, "train", num_proc=num_workers),
+        "test": _preprocess_split(ds["test"], fixed_height, tokenizer, text_col, filter_config, "test", num_proc=num_workers)
+    })
+
+
     bucket_bin = 64 if (torch.backends.cudnn.benchmark or bin_bucket_widths) else None
     widths_train = _bucket_widths(ds["train"]["width"], bin_size=bucket_bin)
 
-    train_transform = make_basic_image_transform(
-        fixed_height=fixed_height, augment=augmentation is Augmentation.CPU
+    train_transform = make_runtime_transform(
+        augment=augmentation is Augmentation.CPU
     )
-    test_transform = make_basic_image_transform(
-        fixed_height=fixed_height, augment=False
-    )
+    test_transform = make_runtime_transform(augment=False)
+
     ds = datasets.DatasetDict(
         {
             "train": ds["train"].with_transform(train_transform),

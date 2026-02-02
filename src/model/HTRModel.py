@@ -31,9 +31,9 @@ class ConvBlock(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: int = 3,
+        kernel_size: tuple[int,int] | int = 3,
         stride: int = 1,
-        padding: int = 1,
+        padding: tuple[int,int] | int = 1,
         norm_type: NormType | str = NormType.GROUP,
     ):
         super().__init__()
@@ -52,24 +52,35 @@ class ResidualBlock(nn.Module):
 
     def __init__(
         self,
-        channels: int,
+        in_channels: int,
+        out_channels: int | None = None,
+        use_se: bool = False,
         norm_type: NormType | str = NormType.GROUP,
         dropout: float = 0.0,
     ):
         super().__init__()
-        self.norm1 = get_norm(norm_type, channels)
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.norm2 = get_norm(norm_type, channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        out_channels = out_channels or in_channels
+
+        self.norm1 = get_norm(norm_type, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+        self.norm2 = get_norm(norm_type, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
         self.act = nn.GELU()
         self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.se = SEBlock(out_channels) if use_se else nn.Identity()
+
+        self.projection_shortcut = (
+            nn.Conv2d(in_channels, out_channels, 1, bias=False)
+            if in_channels != out_channels else nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
+        identity = self.projection_shortcut(x)
         out = self.act(self.norm1(x))
         out = self.conv1(out)
         out = self.act(self.norm2(out))
         out = self.conv2(out)
+        out = self.se(out)
         out = self.dropout(out)
         return out + identity
 
@@ -78,30 +89,40 @@ class BottleneckResBlock(nn.Module):
 
     def __init__(
         self,
-        channels: int,
+        in_channels: int,
+        out_channels: int | None = None,
         reduction: int = 4,
+        use_se: bool = False,
         norm_type: NormType | str = NormType.GROUP,
         dropout: float = 0.0,
     ):
         super().__init__()
-        mid = channels // reduction
+        out_channels = out_channels or in_channels
+        mid = out_channels // reduction
 
-        self.norm1 = get_norm(norm_type, channels)
-        self.conv1 = nn.Conv2d(channels, mid, 1, bias = False)
+        self.norm1 = get_norm(norm_type, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, mid, 1, bias = False)
 
         self.norm2 = get_norm(norm_type, mid)
         self.conv2 = nn.Conv2d(mid, mid, 3, padding=1, bias=False)
 
         self.norm3 = get_norm(norm_type, mid)
-        self.conv3 = nn.Conv2d(mid, channels, 1, bias=False)
+        self.conv3 = nn.Conv2d(mid, out_channels, 1, bias=False)
 
         self.act = nn.GELU()
         self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
+        self.se = SEBlock(out_channels) if use_se else nn.Identity()
+
+        self.projection_shortcut = (
+            nn.Conv2d(in_channels, out_channels, 1, bias=False)
+            if in_channels != out_channels else nn.Identity()
+        )
+
         nn.init.zeros_(self.conv3.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
+        identity = self.projection_shortcut(x)
 
         out = self.act(self.norm1(x))
         out = self.conv1(out)
@@ -111,6 +132,8 @@ class BottleneckResBlock(nn.Module):
 
         out = self.act(self.norm3(out))
         out = self.conv3(out)
+
+        out = self.se(out)
 
         out = self.dropout(out)
         return out + identity
@@ -145,22 +168,30 @@ class CNNBackbone(nn.Module):
     def __init__(
         self,
         in_channels: int,
-        stage_channels: list[int] | None = None,
-        pool_kernels: list[tuple[int, int]] | None = None,
+        stage_channels: list[int] | None = None, # None to use defaults
+        pool_kernels: list[tuple[int, int]] | None = None, # None to use defaults
+        blocks_per_stage: list[int] | None = None,
         norm_type: NormType | str = NormType.GROUP,
-        use_res_blocks: bool = True,
+        stem_channels: int | None = 32, # None to not use it
+        stem_kernel: int = 7,
+        use_resblock_stack: bool = True,
         use_se: bool = False,
+        use_bottleneck_above: int | None = 256, # None to never use it
         spatial_dropout: float = 0.0,
         residual_dropout: float = 0.0,
     ):
         super().__init__()
 
-        stage_channels = stage_channels or [64, 128, 256, 256, 512, 512]
+        self.norm_type = NormType(norm_type)
+
+        stage_channels = stage_channels or [32, 32, 64, 64, 128, 128]
         pool_kernels = pool_kernels or [(2, 2), (2, 2), (2, 2), (2, 1)]
+        blocks_per_stage = blocks_per_stage or [1] * len(stage_channels)
 
         self.stage_channels = list(stage_channels)
         self.pool_kernels = [tuple(k) for k in pool_kernels]
         self.use_se = use_se
+        self.use_bottleneck_above = use_bottleneck_above
 
         # Compute reduction factors
         self.time_reduction = 1
@@ -169,22 +200,40 @@ class CNNBackbone(nn.Module):
             self.time_reduction *= k_w
             self.height_reduction *= k_h
 
+        
+        if stem_channels is not None:
+            stem_pad = stem_kernel // 2
+            stem_stride = (4, 2)
+            self.stem = nn.Sequential(
+                nn.Conv2d(in_channels, stem_channels, stem_kernel, stride=stem_stride, padding=stem_pad, bias=False),
+                get_norm(norm_type, stem_channels),
+                nn.ReLU(inplace=True),
+            )
+            in_ch = stem_channels
+
+            self.height_reduction *= stem_stride[0]
+            self.time_reduction *= stem_stride[1]
+
+        else:
+            self.stem = None
+            in_ch = in_channels
+
+
         # Build stages
         self.stages = nn.ModuleList()
-        in_ch = in_channels
 
-        for i, out_ch in enumerate(self.stage_channels):
-            layers: list[nn.Module] = [
-                ConvBlock(in_ch, out_ch, norm_type=norm_type),
-            ]
-            if use_res_blocks and i > 2:
-                if out_ch >= 256:
-                    layers.append(BottleneckResBlock(out_ch, norm_type=norm_type, dropout=residual_dropout))
-                else:
-                    layers.append(ResidualBlock(out_ch, norm_type=norm_type, dropout=residual_dropout))
+        for i, (out_ch, num_blocks) in enumerate(zip(self.stage_channels, blocks_per_stage)):
+            layers = []
 
-            if use_se:
-                layers.append(SEBlock(out_ch))
+            if use_resblock_stack:
+                for b in range(num_blocks):
+                    block_in = in_ch if b == 0 else out_ch
+                    layers.append(self._make_resblock(block_in, out_ch, self.norm_type, residual_dropout))
+            else:
+                layers.append(ConvBlock(in_ch, out_ch, norm_type=self.norm_type))
+                for _ in range(num_blocks - 1):
+                    layers.append(self._make_resblock(out_ch, out_ch, self.norm_type, residual_dropout))
+
 
             if spatial_dropout > 0:
                 layers.append(nn.Dropout2d(spatial_dropout))
@@ -198,7 +247,40 @@ class CNNBackbone(nn.Module):
 
         self.out_channels = self.stage_channels[-1]
 
+    def _make_resblock(
+            self,
+            in_ch: int,
+            out_ch: int,
+            norm_type: NormType,
+            dropout: float
+    ) -> nn.Module:
+        """Factory to create the appropriate resblock variant"""
+        use_bottleneck = (
+            self.use_bottleneck_above is not None
+            and out_ch >= self.use_bottleneck_above
+        )
+
+        if use_bottleneck:
+            return BottleneckResBlock(
+                in_channels=in_ch,
+                out_channels=out_ch,
+                use_se=self.use_se,
+                norm_type=norm_type,
+                dropout=dropout,
+            )
+        else:
+            return ResidualBlock(
+                in_channels=in_ch,
+                out_channels=out_ch,
+                use_se=self.use_se,
+                norm_type=norm_type,
+                dropout=dropout,
+            )
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.stem is not None:
+            x = self.stem(x)
         for stage in self.stages:
             x = stage(x)
         return x
@@ -453,7 +535,6 @@ class TransformerEncoder(SequenceEncoder):
                 )
 
         # projection from last conv channels to hidden size
-
         if input_size != hidden_size:
                 self.input_proj = nn.Linear(input_size, hidden_size)
         else:
@@ -551,14 +632,18 @@ class HTRModel(nn.Module):
         dropout: DropoutConfig,
         conv_channels: list[int] | None = None,
         pool_kernels: list[tuple[int, int]] | None = None,
-        use_res_blocks: bool = True,
-        hidden_size: int = 384,
+        blocks_per_stage: list[int] | None = None,
+        stem_channels: int | None = None,
+        stem_kernel: int = 7,
+        use_resblock_stack: bool = False,
+        use_bottleneck_above: int | None = None,
+        hidden_size: int = 256,
         num_layers: int = 3,
         seq_encoder: SequenceEncoderType = SequenceEncoderType.LSTM,
         norm_type: NormType = NormType.GROUP,
         height_collapse: HeightCollapseMode = HeightCollapseMode.MEAN,
-        temporal_convolution: bool = True,
-        self_excitation: bool = False,
+        temporal_convolution: bool = False,
+        squeeze_excitation: bool = False,
         input_height: int | None = None,
         shortcut_ctc: bool = True,
     ):
@@ -572,7 +657,11 @@ class HTRModel(nn.Module):
             "num_classes": num_classes,
             "conv_channels": conv_channels,
             "pool_kernels": pool_kernels,
-            "use_res_blocks": use_res_blocks,
+            "blocks_per_stage": blocks_per_stage,
+            "stem_channels": stem_channels,
+            "stem_kernel": stem_kernel,
+            "use_resblock_stack": use_resblock_stack,
+            "use_bottleneck_above": use_bottleneck_above,
             "hidden_size": hidden_size,
             "num_layers": num_layers,
             "dropout": asdict(self.dropout_conf),
@@ -580,7 +669,7 @@ class HTRModel(nn.Module):
             "norm_type": norm_type.value,
             "height_collapse": height_collapse.value,
             "temporal_convolution": temporal_convolution,
-            "self_excitation": self_excitation,
+            "squeeze_excitation": squeeze_excitation,
             "input_height": input_height,
             "shortcut_ctc": shortcut_ctc,
         }
@@ -589,10 +678,12 @@ class HTRModel(nn.Module):
         self.backbone = CNNBackbone(
             in_channels=img_channels,
             stage_channels=conv_channels,
+            stem_channels=stem_channels,
+            blocks_per_stage=blocks_per_stage,
+            use_resblock_stack=use_resblock_stack,
             pool_kernels=pool_kernels,
-            use_res_blocks=use_res_blocks,
             norm_type=norm_type,
-            use_se=self_excitation,
+            use_se=squeeze_excitation,
             spatial_dropout=self.dropout_conf.conv,
             residual_dropout=self.dropout_conf.residual,
         )
@@ -646,8 +737,7 @@ class HTRModel(nn.Module):
     def output_lengths(self, widths: torch.Tensor) -> torch.Tensor:
         """Map input widths (pixels) to output sequence lengths for CTC."""
         lengths = widths.to(dtype=torch.int64)
-        for _, k_w in self.backbone.pool_kernels:
-            lengths = lengths // k_w
+        lengths = lengths // self.backbone.time_reduction
         return lengths
 
 

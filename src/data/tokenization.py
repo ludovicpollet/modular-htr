@@ -87,6 +87,7 @@ def build_char_tokenizer(
             batch_size=1000,
             num_proc=num_proc,
             remove_columns=split_ds.column_names,
+            desc="Counting characters"
         )
         for s in tmp["chars"]:
             counter.update(s)
@@ -126,4 +127,5 @@ def apply_ctc_tokenizer(
     return ds.map(
         _tokenize_example,
         fn_kwargs={"tokenizer": tokenizer, "text_col": text_col},
+        desc="Applying CTC tokenizer"
     )

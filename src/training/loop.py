@@ -17,7 +17,7 @@ from src.types import Augmentation, CTCDecoderMode, DebugMode
 
 from .ctc import CTCLossWrapper, beam_ctc_decode, build_beam_decoder, greedy_ctc_decode
 from .metrics import cer, wer
-from .utils import CheckpointManager, ScalarMeter, format_metrics
+from .utils import CheckpointManager, ScalarMeter, format_metrics, linear_scale
 
 type Model = CRNN | HTRModel
 
@@ -80,7 +80,7 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         iterator = (
-            tqdm(dataloader, desc="Train", leave=False)
+            tqdm(dataloader, desc="Train", leave=False, dynamic_ncols=True)
             if self.use_pbars
             else dataloader
         )
@@ -94,8 +94,9 @@ class Trainer:
             # augment on gpu for the more expensive operations
             if self.augment:
                 images = self.aug_module(images)
-
-            # images = images.contiguous(memory_format=torch.channels_last)
+            
+            if self.cfg.channels_last:
+                images = images.contiguous(memory_format=torch.channels_last)
 
             # --- forward pass ---
             blank_rate = None
@@ -120,7 +121,7 @@ class Trainer:
                         input_lengths,
                         batch.target_lengths,
                     )
-                    loss_total = loss_main + shortcut_loss
+                    loss_total = loss_main + (linear_scale(self.cfg.epochs, current_epoch) * shortcut_loss)
                     running_loss_main.update(loss_main)
                     running_loss_shortcut.update(shortcut_loss)
                 running_loss.update(loss_total)
@@ -281,7 +282,7 @@ class Trainer:
         hyps = []
 
         iterator = (
-            tqdm(dataloader, desc="Eval", leave=False) if self.use_pbars else dataloader
+            tqdm(dataloader, desc="Eval", leave=False, dynamic_ncols=True) if self.use_pbars else dataloader
         )
 
         with torch.inference_mode():
@@ -332,7 +333,7 @@ class Trainer:
             metrics_history = []
 
         epoch_iter = (
-            tqdm(range(1, self.cfg.epochs + 1), desc="Epochs")
+            tqdm(range(1, self.cfg.epochs + 1), desc="Epochs", dynamic_ncols=True)
             if self.use_pbars
             else range(1, self.cfg.epochs + 1)
         )
@@ -389,17 +390,6 @@ class Trainer:
                     )
 
         return self.model, metrics_history
-
-
-def _should_skip_batch(input_lengths: torch.Tensor, current_epoch: int | None) -> bool:
-    if current_epoch is None:
-        return False
-    max_len = input_lengths.max().item()
-    if current_epoch < 10 and max_len > 250:
-        return True
-    if current_epoch < 30 and max_len > 350:
-        return True
-    return False
 
 
 def _append_rows_to_csv(

@@ -13,6 +13,8 @@ class LocalDataset:
     path: Path
     # Name of the column that stores the labels.
     text_col: str = "text"
+    # Name of the column that stores the line images.
+    img_col: str = "image"
 
 
 @dataclass
@@ -21,9 +23,27 @@ class HubDataset:
     name: str
     # Name of the column that stores the labels.
     text_col: str = "text"
+    # Name of the column that stores the line images.
+    img_col: str = "image"
 
 
 type Dataset = Annotated[LocalDataset, tyro.conf.subcommand("local")] | Annotated[HubDataset, tyro.conf.subcommand("hub")]
+
+@dataclass
+class WidthFilters:
+    # Filter unusually large images for memory efficiency.
+    filter_large_images: bool = True
+    # Percentile of images widths to use as threshold for filtering.
+    width_percentile: float = 97.0
+    # Ignore the percentile and use a specific width as threshold. 
+    max_width: int | None = None
+    # Filter samples which would not yield enough timesteps per character for CTC to work.
+    enforce_ctc_width: bool = True
+    # Margin to account for CTC blank characters in timesteps/chars ratio computations.
+    ctc_margin: float = 1.1
+    # The total reduction factor of the model along the time dimension.
+    # Should be set according to the settings of the chosen CNN backbone.
+    time_reduction_factor: int = 8
 
 
 @dataclass
@@ -39,6 +59,8 @@ class Data:
     use_bucketing: bool = True
     # Type of data augmentation to use.
     augmentation: types.Augmentation = types.Augmentation.CPU
+    # Configuration options for the width filters
+    width_filters: WidthFilters = field(default_factory=WidthFilters)
 
 
 @dataclass
@@ -85,6 +107,8 @@ class Trainer:
     # Enables Automatic Mixed Precision [AMP] casting in chosen regions to improve performance; will also enable gradient scaling to improve convergence.
     # Setting to true might make CTC training brittle.
     amp: bool = False
+    # Use NHWC tensor layout in memory instead of NCHW to optimise CNN computations on modern GPUs. 
+    channels_last: bool = True
     # Enables logging of per-batch diagnostics. Use "print" to emit to console, "log" to only write CSV, None to disable.
     debug: types.DebugMode | None = None
     # Disable the progress bars
@@ -116,26 +140,29 @@ class CRNNConfig:
 class DropoutConfig:
     """Dropout configuration for all model components"""
 
-    # Dropout2d after CNN stages (spatial dropout)
+    # Dropout2d rate after CNN stages (spatial dropout).
     conv: float = 0.1
-    # Dropout2d inside ResidualBlocks
+    # Dropout2d rate inside ResidualBlocks.
     residual: float = 0.1
-    # Dropout in TemporalConvBlock
+    # Dropout rate in TemporalConvBlock.
     temporal: float = 0.15
-    # Dropout on attention weights in the height collapse
+    # Dropout rate on attention weights in the height collapse.
     height_attention: float = 0.15
-    # Dropout after position encoding
+    # Dropout rate after position encoding.
     pos_encoding: float = 0.1
-    # Sequence encoder dropout (between layers if LSTM, internal if Transfomer)
+    # Sequence encoder dropout rate (between layers if LSTM, internal if Transfomer).
     encoder: float = 0.3
-    # Dropout before final FC layer
+    # Dropout rate before final FC layer.
     classifier: float = 0.3
 
 @dataclass
 class ModelConfig:
     # Number of input image channels (e.g. 1 for grayscale).
     img_channels: int = 1
-
+    # Number of channels for the stem stage. Zero to skip that step.
+    stem_channels: int = 32
+    # Size of the kernel for the stem stage.
+    stem_kernel: int = 7
     # Outputs channels for each cnn stage (lenght determines number of stages).
     conv_channels: list[int] = field(
         default_factory=lambda: [32, 64, 128, 256, 512]
@@ -145,24 +172,30 @@ class ModelConfig:
         default_factory=lambda: [(2, 2), (2, 2), (2, 2)]
     )
     # Whether to use residual blocks in the cnn stages.
-    # Automatically uses bottleneck blocks for high channel count stages to save compute.
-    use_res_blocks: bool = True
+    use_resblock_stack: bool = True
+    # How many residual blocks get stacked at each stage.
+    blocks_per_stage: list[int] = field(default_factory=lambda: [2, 4, 4])
+    # Use bottlenecks residual blocks to save compute above the defined channel count.
+    # None/0 to never/always use them.
+    use_bottleneck_above: int | None = 256
+    # Whether to use the squeeze-excitation mechanism in the convolution stages.
+    squeeze_excitation: bool = False
     # How to collapse height after CNN
-    height_collapse: types.HeightCollapseMode = types.HeightCollapseMode.MEAN
+    height_collapse: types.HeightCollapseMode = types.HeightCollapseMode.MAX
     # Add residual 1D convolutions over time before the seq encoder
     temporal_convolution: bool = False
-    # Type of the sequence encoder block
-    seq_encoder: types.SequenceEncoderType = types.SequenceEncoderType.TRANSFORMER
+    # Whether to add a CTC shortcut head after the convolutional backbone to help training.
+    shortcut_ctc: bool = True 
+    # Type of the sequence encoder block.
+    seq_encoder: types.SequenceEncoderType = types.SequenceEncoderType.LSTM
     # Number of recurrent layers stacked after the convolutional encoder.
     num_layers: int = 3
     # Hidden size of the recurrent layers.
     hidden_size: int = 256
-    # Whether to use self excitation
-    self_excitation: bool = False
-    # Dropout configuration
+    # Dropout configuration.
     dropout: DropoutConfig = field(default_factory=DropoutConfig)
     # Normalization type. Group is more stable for small batches.
-    norm_type: types.NormType = types.NormType.GROUP
+    norm_type: types.NormType = types.NormType.BATCH
 
 
 @dataclass
@@ -179,9 +212,9 @@ class Onecycle:
     # Annealing strategy for LR schedule
     anneal_strategy: types.AnnealStrategy = types.AnnealStrategy.COS
     # Fraction of total training where LR increases before annealing.
-    pct_start: float = 0.1
+    pct_start: float = 0.01
     # Initial LR = max_lr / div_factor.
-    div_factor: float = 10.0
+    div_factor: float = 5.0
     # Final LR = max_lr / final_div_factor.
     final_div_factor: float = 10.0
     # Update the LR every batch instead of every epoch.
@@ -217,11 +250,12 @@ class Strategy:
 
 type Model = Annotated[CRNNConfig, tyro.conf.subcommand("vanilla")] | Annotated[ModelConfig, tyro.conf.subcommand("v2")]
 type Scheduler = Cosine | Onecycle
-type Config = Train | Finetune
+type Config = Train | Finetune | AnalyseDataset | CompileDataset
 
 
 @dataclass
 class Train:
+    """Configure and train a model from scratch."""
     # Descriptive name that will be appended to the date and time to create the run directory.
     run_name: str
 
@@ -243,6 +277,7 @@ class Train:
 
 @dataclass
 class Finetune:
+    """Rebuild a model and reload weights from a checkpoint for finetuning."""
     # Descriptive name that will be appended to the date and time to create the run directory.
     run_name: str
 
@@ -263,6 +298,32 @@ class Finetune:
     trainer: Trainer = field(default_factory=Trainer)
 
     decoder: CTCDecoder = field(default_factory=CTCDecoder)
+
+@dataclass
+class AnalyseDataset:
+    """Compute and print statistics for a given dataset to help making informed decisions when choosing model architecture hyperparameters."""
+    # The dataset to run the analysis on. Can be either local or pulled from HF Hub.
+    dataset: Dataset
+    # Margin to account for CTC blank character in timestep/chars computations.
+    ctc_margin: float = 1.1
+    # Height is used to compute width at a fixed aspect ratio.
+    fixed_height: int = 128
+    # Compute the ratios for the specified list of network stride/pooling.
+    strides: list[int] = field(default_factory=lambda: [2, 4, 6, 8, 12, 16])
+
+
+@dataclass
+class CompileDataset:
+    """
+    Create a compressed HuggingFace datasets.Dataset from page images and pageXML transcription files.
+    This also splits the samples between a "train" and a "test" (10%) dataset.
+    """
+    # Path to the directory containing the pageXML files.
+    xml_path: Annotated[Path, tyro.conf.arg(name="xml")]
+    # Path to the directory containing the corresponding images.
+    img_path: Annotated[Path, tyro.conf.arg(name="img")]
+    # Directory where the resulting HuggingFace datasets.Dataset will be created.
+    out_path: Annotated[Path, tyro.conf.arg(name="out")]
 
 
 # helper for quick testing:

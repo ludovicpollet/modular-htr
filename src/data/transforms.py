@@ -6,12 +6,15 @@ import torch
 from torchvision.transforms import v2
 from torchvision.transforms.functional import to_tensor
 
+from .tokenization import CharTokenizer
+
 
 class GPUAugmentation:
     """
     This pipeline includes the expensive elastic transform.
     Runs on GPU to prevent slowing things down too much.
     """
+
     def __init__(self, device: torch.device):
         self.module = K.AugmentationSequential(
             K.RandomAffine(
@@ -47,10 +50,44 @@ def resize_keep_aspect(pil_img: PIL.Image.Image, fixed_height: int) -> PIL.Image
     return pil_img.resize((new_w, new_h), resample=PIL.Image.Resampling.HAMMING)
 
 
-def make_basic_image_transform(fixed_height: int, augment: bool = False) -> Callable:
+def make_preprocessing_fn(
+    fixed_height: int,
+    tokenizer: CharTokenizer,
+    text_col: str = "text",
+) -> Callable:
     """
-    Returns a callable suitable for datasets.Dataset.with_transform.
-    Optionnaly includes the lighter transforms that can run on CPU.
+    One-time preprocessing pipeline to avoid repeated maps. Cached by HuggingFace datasets.
+    (load) -> (to grayscale) -> resize -> get new width -> tokenize
+    """
+
+    def _preprocess(example):
+        img = example["image"]
+        # handle lazy-loading images
+        if not isinstance(img, PIL.Image.Image):
+            img = PIL.Image.open(img)
+        # convert to grayscale
+        if img.mode != "L":
+            img = img.convert("L")
+        # resize
+        img = resize_keep_aspect(img, fixed_height)
+
+        # tokenization
+        text = example[text_col]
+        labels = tokenizer.encode(text)
+
+        return {
+            "image": img,
+            "width": img.size[0],
+            "labels": labels,
+            "label_length": len(labels),
+        }
+
+    return _preprocess
+
+
+def make_runtime_transform(augment: bool = False) -> Callable:
+    """
+    Returns the training transforms: to_tensor, and optionnaly the lighter augmentations that can run on CPU.
     The caller must not set augment=True if the GPU augmentation pipeline is in use.
     """
     aug = None
@@ -72,16 +109,11 @@ def make_basic_image_transform(fixed_height: int, augment: bool = False) -> Call
 
     def _transform(batch):
         images = []
-        widths = []
         for img in batch["image"]:
-            img = resize_keep_aspect(img, fixed_height)
             if aug is not None:
                 img = aug(img)
-
-            widths.append(img.size[0])
             images.append(to_tensor(img))
         batch["image"] = images
-        batch["width"] = widths
         return batch
 
     return _transform

@@ -3,14 +3,15 @@ import json
 import pathlib
 import random
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 
 from src import types
-from src.config import Config
+from src import config
 from src.data.tokenization import CharTokenizer
 
 
@@ -48,6 +49,16 @@ def configure_torch(benchmark: bool = True) -> None:
     torch.backends.cudnn.deterministic = False
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+
+def get_dataset(cfg: config.Dataset) -> Dataset | DatasetDict:
+    """Utility to load a dataset from disk or hub."""
+    if isinstance(cfg, config.LocalDataset):
+        return load_from_disk(cfg.path)
+    if isinstance(cfg, config.HubDataset):
+        # casting to avoid the iterable return types variant
+        # to do later, maybe support streaming
+        return cast(Dataset | DatasetDict, load_dataset(cfg.name, streaming=False))
 
 
 def make_log_fn(use_pbar: bool = True) -> Callable[[str], None]:
@@ -113,13 +124,20 @@ def serialize_optimizer_config(optimizer) -> dict[str, Any]:
     return opt_config
 
 
-def dump_config(run_dir: pathlib.Path, run_config: Config) -> None:
+def dump_config(run_dir: pathlib.Path, run_config: config.Config) -> None:
     if not run_dir.is_dir():
         raise FileNotFoundError(
             f"Cannot save config file. Run directory does not exist: {run_dir}"
         )
     path = run_dir / "config.json"
     path.write_text(json.dumps(asdict(run_config), indent=2, default=str))
+
+
+def linear_scale(total_epochs: int, current_epoch: int) -> float:
+    """A simple linear scale for the shortcut loss"""
+    start = 1
+    end = 0.1
+    return start + (end - start) * (current_epoch / total_epochs)
 
 
 class ScalarMeter:
