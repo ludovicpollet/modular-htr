@@ -98,12 +98,16 @@ def run_training(cfg: src.config.Train) -> None:
 
     ds = get_dataset(cfg.data.dataset)
     text_col = cfg.data.dataset.text_col
-    tokenizer = build_char_tokenizer(ds, text_col)
+    tokenizer = build_char_tokenizer(ds, text_col, cfg.data.unicode_normalize)
+
+    print(f"Built the tokenizer with {len(tokenizer)} chars:")
+    print(tokenizer.to_dict()["alphabet"])
 
     train_loader, val_loader = make_dataloaders(
         ds,  # type: ignore (should be duck-type compatible)
         tokenizer=tokenizer,
         text_col=text_col,
+        image_col=cfg.data.dataset.img_col,
         filter_config=cfg.data.width_filters,
         fixed_height=cfg.data.fixed_height,
         batch_size=cfg.data.batch_size,
@@ -199,6 +203,8 @@ def run_finetune(cfg: src.config.Finetune) -> None:
         finetune_ds,  # type: ignore (should be duck-type compatible)
         filter_config=cfg.data.width_filters,
         tokenizer=tokenizer,
+        text_col=cfg.data.dataset.text_col,
+        image_col=cfg.data.dataset.img_col,
         fixed_height=cfg.data.fixed_height,
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,

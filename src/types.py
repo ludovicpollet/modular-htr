@@ -1,6 +1,13 @@
 import enum
 
 
+class UnicodeForm(str, enum.Enum):
+    NFC = "NFC"
+    NFD = "NFD"
+    NFKC = "NFKC"
+    NFKD = "NFKD"
+
+
 class Augmentation(str, enum.Enum):
     CPU = "cpu"
     GPU = "gpu"

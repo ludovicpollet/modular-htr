@@ -217,6 +217,7 @@ def _preprocess_split(
     fixed_height: int,
     tokenizer: CharTokenizer,
     text_col: str,
+    image_col: str,
     filter_config: WidthFilters,
     split_name: str,
     num_proc: int,
@@ -230,6 +231,7 @@ def _preprocess_split(
         fixed_height=fixed_height,
         tokenizer=tokenizer,
         text_col=text_col,
+        image_col=image_col
     )
 
     ds = ds.map(
@@ -249,6 +251,7 @@ def make_dataloaders(
     filter_config: WidthFilters,
     tokenizer: CharTokenizer,
     text_col: str = "text",
+    image_col: str = "image",
     fixed_height: int = 96,
     batch_size: int = 32,
     num_workers: int = 16,
@@ -268,8 +271,8 @@ def make_dataloaders(
 
 
     ds = datasets.DatasetDict({
-        "train": _preprocess_split(ds["train"], fixed_height, tokenizer, text_col, filter_config, "train", num_proc=num_workers),
-        "test": _preprocess_split(ds["test"], fixed_height, tokenizer, text_col, filter_config, "test", num_proc=num_workers)
+        "train": _preprocess_split(ds["train"], fixed_height, tokenizer, text_col, image_col, filter_config, "train", num_proc=num_workers),
+        "test": _preprocess_split(ds["test"], fixed_height, tokenizer, text_col, image_col, filter_config, "test", num_proc=num_workers)
     })
 
 

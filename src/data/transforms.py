@@ -54,6 +54,7 @@ def make_preprocessing_fn(
     fixed_height: int,
     tokenizer: CharTokenizer,
     text_col: str = "text",
+    image_col: str = "image",
 ) -> Callable:
     """
     One-time preprocessing pipeline to avoid repeated maps. Cached by HuggingFace datasets.
@@ -61,7 +62,7 @@ def make_preprocessing_fn(
     """
 
     def _preprocess(example):
-        img = example["image"]
+        img = example[image_col]
         # handle lazy-loading images
         if not isinstance(img, PIL.Image.Image):
             img = PIL.Image.open(img)
