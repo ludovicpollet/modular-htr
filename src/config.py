@@ -48,7 +48,11 @@ class WidthFilters:
 
 @dataclass
 class Data:
+    # The Hugging Face dataset to use for training. Can be local or hosted on HF hub.
+    # PageXML datasets must first be compiled with the compile-dataset subcommand to be used.
     dataset: Dataset
+    # Which unicode normalization to use. Set to None to disable.
+    unicode_normalize: types.UnicodeForm | None = None
     # Height of a line image after resize.
     fixed_height: int = 96
     # Number of workers to spawn for dataset processing AND dataloading.
@@ -57,7 +61,7 @@ class Data:
     batch_size: int = 32
     # Bucket batches by width to avoid excessive padding.
     use_bucketing: bool = True
-    # Type of data augmentation to use.
+    # Type of data augmentation to use. GPU uses the full pipeline, CPU disables the most expensive ones.
     augmentation: types.Augmentation = types.Augmentation.CPU
     # Configuration options for the width filters
     width_filters: WidthFilters = field(default_factory=WidthFilters)
@@ -151,9 +155,9 @@ class DropoutConfig:
     # Dropout rate after position encoding.
     pos_encoding: float = 0.1
     # Sequence encoder dropout rate (between layers if LSTM, internal if Transfomer).
-    encoder: float = 0.3
+    encoder: float = 0.1
     # Dropout rate before final FC layer.
-    classifier: float = 0.3
+    classifier: float = 0.1
 
 @dataclass
 class ModelConfig:
@@ -212,9 +216,9 @@ class Onecycle:
     # Annealing strategy for LR schedule
     anneal_strategy: types.AnnealStrategy = types.AnnealStrategy.COS
     # Fraction of total training where LR increases before annealing.
-    pct_start: float = 0.01
+    pct_start: float = 0.1
     # Initial LR = max_lr / div_factor.
-    div_factor: float = 5.0
+    div_factor: float = 10.0
     # Final LR = max_lr / final_div_factor.
     final_div_factor: float = 10.0
     # Update the LR every batch instead of every epoch.

@@ -1,7 +1,6 @@
-import math
 from abc import ABC, abstractmethod
-from typing import Literal, Self
 from dataclasses import asdict
+from typing import Literal, Self
 
 import torch
 import torch.nn as nn
@@ -9,6 +8,8 @@ import torch.nn.functional as F
 
 from src.config import DropoutConfig
 from src.types import HeightCollapseMode, NormType, SequenceEncoderType
+
+from .MHA import RelBiasTransformerStack
 
 
 def get_norm(norm_type: NormType | str, num_channels: int) -> nn.Module:
@@ -31,9 +32,9 @@ class ConvBlock(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: tuple[int,int] | int = 3,
+        kernel_size: tuple[int, int] | int = 3,
         stride: int = 1,
-        padding: tuple[int,int] | int = 1,
+        padding: tuple[int, int] | int = 1,
         norm_type: NormType | str = NormType.GROUP,
     ):
         super().__init__()
@@ -41,7 +42,9 @@ class ConvBlock(nn.Module):
             in_channels, out_channels, kernel_size, stride, padding, bias=False
         )
         self.norm = get_norm(norm_type, out_channels)
-        self.act = nn.GELU() if out_channels >= 128 else nn.LeakyReLU(negative_slope=0.01)
+        self.act = (
+            nn.GELU() if out_channels >= 128 else nn.LeakyReLU(negative_slope=0.01)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.norm(self.conv(x)))
@@ -71,7 +74,8 @@ class ResidualBlock(nn.Module):
 
         self.projection_shortcut = (
             nn.Conv2d(in_channels, out_channels, 1, bias=False)
-            if in_channels != out_channels else nn.Identity()
+            if in_channels != out_channels
+            else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -83,6 +87,7 @@ class ResidualBlock(nn.Module):
         out = self.se(out)
         out = self.dropout(out)
         return out + identity
+
 
 class BottleneckResBlock(nn.Module):
     """Bottleneck residual block to save compute when channel count is high"""
@@ -101,7 +106,7 @@ class BottleneckResBlock(nn.Module):
         mid = out_channels // reduction
 
         self.norm1 = get_norm(norm_type, in_channels)
-        self.conv1 = nn.Conv2d(in_channels, mid, 1, bias = False)
+        self.conv1 = nn.Conv2d(in_channels, mid, 1, bias=False)
 
         self.norm2 = get_norm(norm_type, mid)
         self.conv2 = nn.Conv2d(mid, mid, 3, padding=1, bias=False)
@@ -116,7 +121,8 @@ class BottleneckResBlock(nn.Module):
 
         self.projection_shortcut = (
             nn.Conv2d(in_channels, out_channels, 1, bias=False)
-            if in_channels != out_channels else nn.Identity()
+            if in_channels != out_channels
+            else nn.Identity()
         )
 
         nn.init.zeros_(self.conv3.weight)
@@ -137,6 +143,7 @@ class BottleneckResBlock(nn.Module):
 
         out = self.dropout(out)
         return out + identity
+
 
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation block for channel attention."""
@@ -168,15 +175,15 @@ class CNNBackbone(nn.Module):
     def __init__(
         self,
         in_channels: int,
-        stage_channels: list[int] | None = None, # None to use defaults
-        pool_kernels: list[tuple[int, int]] | None = None, # None to use defaults
+        stage_channels: list[int] | None = None,  # None to use defaults
+        pool_kernels: list[tuple[int, int]] | None = None,  # None to use defaults
         blocks_per_stage: list[int] | None = None,
         norm_type: NormType | str = NormType.GROUP,
-        stem_channels: int | None = 32, # None to not use it
+        stem_channels: int | None = 32,  # None to not use it
         stem_kernel: int = 7,
         use_resblock_stack: bool = True,
         use_se: bool = False,
-        use_bottleneck_above: int | None = 256, # None to never use it
+        use_bottleneck_above: int | None = 256,  # None to never use it
         spatial_dropout: float = 0.0,
         residual_dropout: float = 0.0,
     ):
@@ -200,12 +207,18 @@ class CNNBackbone(nn.Module):
             self.time_reduction *= k_w
             self.height_reduction *= k_h
 
-        
         if stem_channels is not None:
             stem_pad = stem_kernel // 2
             stem_stride = (4, 2)
             self.stem = nn.Sequential(
-                nn.Conv2d(in_channels, stem_channels, stem_kernel, stride=stem_stride, padding=stem_pad, bias=False),
+                nn.Conv2d(
+                    in_channels,
+                    stem_channels,
+                    stem_kernel,
+                    stride=stem_stride,
+                    padding=stem_pad,
+                    bias=False,
+                ),
                 get_norm(norm_type, stem_channels),
                 nn.ReLU(inplace=True),
             )
@@ -218,22 +231,30 @@ class CNNBackbone(nn.Module):
             self.stem = None
             in_ch = in_channels
 
-
         # Build stages
         self.stages = nn.ModuleList()
 
-        for i, (out_ch, num_blocks) in enumerate(zip(self.stage_channels, blocks_per_stage)):
+        for i, (out_ch, num_blocks) in enumerate(
+            zip(self.stage_channels, blocks_per_stage)
+        ):
             layers = []
 
             if use_resblock_stack:
                 for b in range(num_blocks):
                     block_in = in_ch if b == 0 else out_ch
-                    layers.append(self._make_resblock(block_in, out_ch, self.norm_type, residual_dropout))
+                    layers.append(
+                        self._make_resblock(
+                            block_in, out_ch, self.norm_type, residual_dropout
+                        )
+                    )
             else:
                 layers.append(ConvBlock(in_ch, out_ch, norm_type=self.norm_type))
                 for _ in range(num_blocks - 1):
-                    layers.append(self._make_resblock(out_ch, out_ch, self.norm_type, residual_dropout))
-
+                    layers.append(
+                        self._make_resblock(
+                            out_ch, out_ch, self.norm_type, residual_dropout
+                        )
+                    )
 
             if spatial_dropout > 0:
                 layers.append(nn.Dropout2d(spatial_dropout))
@@ -248,11 +269,7 @@ class CNNBackbone(nn.Module):
         self.out_channels = self.stage_channels[-1]
 
     def _make_resblock(
-            self,
-            in_ch: int,
-            out_ch: int,
-            norm_type: NormType,
-            dropout: float
+        self, in_ch: int, out_ch: int, norm_type: NormType, dropout: float
     ) -> nn.Module:
         """Factory to create the appropriate resblock variant"""
         use_bottleneck = (
@@ -276,7 +293,6 @@ class CNNBackbone(nn.Module):
                 norm_type=norm_type,
                 dropout=dropout,
             )
-
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.stem is not None:
@@ -485,33 +501,10 @@ class LSTMEncoder(SequenceEncoder):
         return out  # [T, B, 2*hidden]
 
 
-class SinusoidalPositionalEncoding(nn.Module):
-    """Standard sinusoidal positional encoding."""
-
-    pe: torch.Tensor  # declare buffer type
-
-    def __init__(self, d_model: int, max_len: int = 2048, dropout: float = 0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
-        self.register_buffer("pe", pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, C]
-        x = x + self.pe[:, : x.size(1), :]
-        return self.dropout(x)
-
-
-class TransformerEncoder(SequenceEncoder):
-    """Transformer encoder with positional encoding."""
+class RelBiasTransformerEncoder(SequenceEncoder):
+    """
+    Transformer encoder using relative sinusoidal bias-only PE
+    """
 
     _positions: torch.Tensor
 
@@ -521,46 +514,36 @@ class TransformerEncoder(SequenceEncoder):
         hidden_size: int,
         num_layers: int,
         dropout: float,
-        pos_encoding_dropout: float,
         nhead: int = 4,
         dim_feedforward: int | None = None,
         max_seq_len: int = 4096,
+        max_rel: int = 256,
+        rel_dim: int = 32,
     ):
         super().__init__()
 
         if hidden_size % nhead != 0:
-                raise ValueError(
-                    f"hidden_size ({hidden_size}) must be divisible by nhead ({nhead}). "
-                    f"Try hidden_size={nhead * (hidden_size // nhead)} or nhead={hidden_size // (hidden_size // nhead)}"
-                )
-
-        # projection from last conv channels to hidden size
-        if input_size != hidden_size:
-                self.input_proj = nn.Linear(input_size, hidden_size)
-        else:
-            self.input_proj = nn.Identity()
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by nhead ({nhead})."
+            )
 
         self._output_size = hidden_size
         dim_feedforward = dim_feedforward or 4 * hidden_size
 
-        self.pos_encoding = SinusoidalPositionalEncoding(
-            hidden_size, max_len=max_seq_len, dropout=pos_encoding_dropout
+        self.input_proj = (
+            nn.Linear(input_size, hidden_size)
+            if input_size != hidden_size
+            else nn.Identity()
         )
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        self.transformer = RelBiasTransformerStack(
+            num_layers=num_layers,
             d_model=hidden_size,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-            enable_nested_tensor=False,
-            norm=nn.LayerNorm(hidden_size),
+            max_rel=max_rel,
+            rel_dim=rel_dim,
         )
 
         self.register_buffer(
@@ -581,16 +564,16 @@ class TransformerEncoder(SequenceEncoder):
         seq = self.input_proj(seq)
         _B, T, _C = seq.shape
 
-        # create a padding mask (ignore position where True)
         mask = None
         if lengths is not None:
             if lengths.device != seq.device:
                 lengths = lengths.to(seq.device, non_blocking=True)
-            mask = self._positions[:T].unsqueeze(0) >= lengths.unsqueeze(1)
+            mask = self._positions[:T].unsqueeze(0) >= lengths.unsqueeze(
+                1
+            )  # [B,T] bool
 
-        seq = self.pos_encoding(seq)
-        out = self.transformer(seq, src_key_padding_mask=mask)  # [B, T, C]
-        return out.permute(1, 0, 2)  # [T, B, C] for CTC
+        out = self.transformer(seq, src_key_padding_mask=mask)  # [B,T,C]
+        return out.permute(1, 0, 2)  # [T,B,C] for CTC
 
 
 def create_sequence_encoder(
@@ -608,12 +591,11 @@ def create_sequence_encoder(
     if type == SequenceEncoderType.LSTM:
         return LSTMEncoder(input_size, hidden_size, num_layers, dropout)
     elif type == SequenceEncoderType.TRANSFORMER:
-        return TransformerEncoder(
+        return RelBiasTransformerEncoder(
             input_size,
             hidden_size,
             num_layers=num_layers,
             dropout=dropout,
-            pos_encoding_dropout=pos_encoding_dropout,
             **kwargs,
         )
     raise ValueError(f"Unknown sequence encoder type: {type}")
@@ -623,6 +605,8 @@ class HTRModel(nn.Module):
     """
     Modular CNN-RNN architecture for CTC-based text recognition.
     CNN Backbone -> Height Collapse -> (CTC Shortcut) - > (Temporal Conv) -> Sequence Encoder -> FC
+    Allows the creation of a residual backbone with optional CTC shortcut like the one used by Retsinas et al. in "Best practices for a handwritten text recognition system" (2022), combined with an LSTM or a multihead attention encoder like the one used by Diaz et al. "Rethinking Text Line Recognition models" (2021).
+    Simpler architectures like the one used by J. Puigcerver in "Are Multidimensional Recurrent Layers Really Necessary for Handwritten Text Recognition?" (2017) are also configurable for comparison.
     """
 
     def __init__(
@@ -652,7 +636,7 @@ class HTRModel(nn.Module):
 
         # Store config
         self._config = {
-            "model_type":"HTRModel",
+            "model_type": "HTRModel",
             "img_channels": img_channels,
             "num_classes": num_classes,
             "conv_channels": conv_channels,
@@ -707,7 +691,9 @@ class HTRModel(nn.Module):
         )
 
         if shortcut_ctc:
-            self.shortcut_head = nn.Conv1d(feature_size, num_classes, kernel_size=3, padding=1)
+            self.shortcut_head = nn.Conv1d(
+                feature_size, num_classes, kernel_size=3, padding=1
+            )
 
         # Temporal convolution
         self.temporal_conv_layer: TemporalConvBlock | None = None
@@ -740,7 +726,6 @@ class HTRModel(nn.Module):
         lengths = lengths // self.backbone.time_reduction
         return lengths
 
-
     def forward(
         self, x: torch.Tensor, lengths: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -755,9 +740,9 @@ class HTRModel(nn.Module):
         features = self.height_collapse_layer(features)
 
         shortcut_logits = None
-        if hasattr(self, 'shortcut_head'):
-                   shortcut_logits = self.shortcut_head(features)
-                   shortcut_logits = shortcut_logits.permute(2, 0, 1)
+        if hasattr(self, "shortcut_head"):
+            shortcut_logits = self.shortcut_head(features)
+            shortcut_logits = shortcut_logits.permute(2, 0, 1)
 
         # Temporal conv: [B, Cf, T]
         if self.temporal_conv_layer is not None:
@@ -786,17 +771,25 @@ class HTRModel(nn.Module):
         return config
 
     @classmethod
-    def from_config(cls, config: dict, *, num_classes: int, input_height: int | None = None) -> Self:
+    def from_config(
+        cls, config: dict, *, num_classes: int, input_height: int | None = None
+    ) -> Self:
         """Create model from configuration dict."""
         config = config.copy()
         saved_height = config.get("input_height")
-        if input_height is not None and saved_height is not None and input_height != saved_height:
+        if (
+            input_height is not None
+            and saved_height is not None
+            and input_height != saved_height
+        ):
             config["input_height"] = input_height
-            print(f"[WARNING] Model was trained with input height {saved_height}; rebuilding with {input_height}.")
+            print(
+                f"[WARNING] Model was trained with input height {saved_height}; rebuilding with {input_height}."
+            )
         if input_height is not None:
             config["input_height"] = input_height
         elif saved_height is not None:
-            pass # already in
+            pass  # already in
         else:
             raise ValueError("Missing input_height (needs to be passed if not stored).")
 
