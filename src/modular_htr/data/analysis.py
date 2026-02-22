@@ -4,14 +4,14 @@ from functools import partial
 import numpy as np
 from tabulate import tabulate
 
-from src.training.utils import get_dataset
-import src.config
+from modular_htr.training.utils import get_dataset
+import modular_htr.config
 
 
 def get_map_params(dataset_len):
     """
     Compute reasonable num_proc and batch_size for dataset.map().
-    There are no tests behing it, this is me purely guessing and trying to avoid large batches
+    There are no tests behind it, this is me purely guessing, trying to avoid large batches
     and multiprocessing for small datasets.
     """
     MAX_NUM_PROC = max((os.cpu_count() or 1) - 2, 1)
@@ -38,7 +38,7 @@ def compute_dimensions(batch, img_col: str, text_col: str, fixed_height: int):
     for img, txt in zip(batch[img_col], batch[text_col]):
         w, h = img.size
         widths.append(round(w * fixed_height / h))
-        lengths.append(len(txt))
+        lengths.append(len(txt) if txt is not None else 0)
     return {"resized_width": widths, "text_len": lengths}
 
 
@@ -53,7 +53,9 @@ def print_title(title: str, width: int):
     print(f"{'=' * left} {title} {'=' * right}")
 
 
-def compute_ctc_stats(W, L, strides, margin, width_mask=None, blank_worst_case: bool = False):
+def compute_ctc_stats(
+    W, L, strides, margin, width_mask=None, blank_worst_case: bool = False
+):
     """Compute CTC feasibility stats for given strides."""
     if width_mask is None:
         width_mask = np.ones(len(W), dtype=bool)
@@ -61,7 +63,6 @@ def compute_ctc_stats(W, L, strides, margin, width_mask=None, blank_worst_case: 
     W = W[width_mask]
     L = L[width_mask]
     T_req = 2 * L - 1 if blank_worst_case else L
-
 
     rows = []
     for stride in strides:
@@ -80,28 +81,22 @@ def compute_ctc_stats(W, L, strides, margin, width_mask=None, blank_worst_case: 
     return rows
 
 
-def run_analysis(cfg: src.config.AnalyseDataset):
+def run_analysis(cfg: modular_htr.config.AnalyseDataset):
     PERCENTILES = [25, 50, 75, 90, 95, 99]
-    SPLITS = ["train", "test"]
-    #ds = load_from_disk(DATA_PATH)
-    #ds = load_dataset("magistermilitum/Tridis")
     ds = get_dataset(cfg.dataset)
 
     compute_dims_callable = partial(
         compute_dimensions,
-        img_col = cfg.dataset.img_col,
+        img_col=cfg.dataset.img_col,
         text_col=cfg.dataset.text_col,
-        fixed_height=cfg.fixed_height)
-    
-    
+        fixed_height=cfg.fixed_height,
+    )
 
-
-    for split in SPLITS:
+    for split in ds:
         split_ds = ds[split]
         num_proc, batch_size = get_map_params(len(split_ds))
 
-
-        tmp = split_ds.map( #type: ignore
+        tmp = split_ds.map(  # type: ignore
             compute_dims_callable,
             batched=True,
             batch_size=batch_size,
@@ -179,7 +174,10 @@ def run_analysis(cfg: src.config.AnalyseDataset):
         table_width = max(
             len(summary.splitlines()[0]), len(stride_table.splitlines()[0])
         )
-        print_title(f"{split.upper()}  (N={len(W):,}, H={cfg.fixed_height}, W_p95={int(W_p95)}px)", table_width)
+        print_title(
+            f"{str(split).upper()}  (N={len(W):,}, H={cfg.fixed_height}, W_p95={int(W_p95)}px)",
+            table_width,
+        )
         print(summary)
         print()
         print(stride_table)

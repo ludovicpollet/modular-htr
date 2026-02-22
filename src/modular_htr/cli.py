@@ -5,51 +5,64 @@ import torch
 import tyro
 from torchinfo import summary
 
-import src.config
-from src.data.dataloaders import make_dataloaders
-from src.data.tokenization import apply_ctc_tokenizer, build_char_tokenizer
-from src.data.hf_dataset import build_hf_dataset
-from src.data.analysis import run_analysis
-from src.model.CRNN import CRNN
-from src.model.HTRModel import HTRModel
-from src.training.ctc import CTCLossWrapper
-from src.training.finetune import (
+import modular_htr.config
+from modular_htr.data.analysis import run_analysis
+from modular_htr.data.dataloaders import make_dataloaders
+from modular_htr.data.hf_dataset import build_hf_dataset
+from modular_htr.data.tokenization import apply_ctc_tokenizer, build_char_tokenizer
+from modular_htr.model.HTRModel import HTRModel
+from modular_htr.training.ctc import CTCLossWrapper
+from modular_htr.training.evaluate import run_evaluate
+from modular_htr.training.finetune import (
     freeze_cnn_stages,
     make_unfreeze_callback,
     prepare_finetune_model,
 )
-from src.training.loop import Trainer
-from src.training.utils import (
+from modular_htr.training.loop import Trainer
+from modular_htr.training.utils import (
     CheckpointManager,
     configure_torch,
     create_run_dir,
-    get_dataset,
     dump_config,
+    get_dataset,
     get_device,
     log_model_info,
     set_all_seeds,
 )
-from src.types import MonitorMetric
+from modular_htr.types import MonitorMetric
 
 type Scheduler = (
     torch.optim.lr_scheduler.OneCycleLR | torch.optim.lr_scheduler.CosineAnnealingLR
 )
 
 
-def build_model(
-    cfg: src.config.Model, num_classes: int, input_height: int | None = None
-) -> CRNN | HTRModel:
-    if isinstance(cfg, src.config.CRNNConfig):
-        return CRNN.from_config(asdict(cfg), num_classes=num_classes)
-    if isinstance(cfg, src.config.ModelConfig):
-        return HTRModel.from_config(
-            asdict(cfg), num_classes=num_classes, input_height=input_height
-        )
-    raise NotImplementedError(f"Unkown model type: {cfg.__class__.__name__}")
+def build_model(cfg: modular_htr.config.ModelConfig, num_classes: int) -> HTRModel:
+    backbone_cfg = asdict(cfg.backbone)
+    model_dict = {
+        "num_classes": num_classes,
+        "backbone_config": backbone_cfg,
+        "img_channels": cfg.img_channels,
+        "hidden_size": cfg.hidden_size,
+        "num_layers": cfg.num_layers,
+        "seq_encoder": cfg.seq_encoder,
+        "height_collapse": cfg.height_collapse,
+        "temporal_convolution": cfg.temporal_convolution,
+        "fixed_height": cfg.fixed_height,
+        "shortcut_ctc": cfg.shortcut_ctc,
+        "temporal_dropout": cfg.temporal_dropout,
+        "height_attention_dropout": cfg.height_attention_dropout,
+        "pos_encoding_dropout": cfg.pos_encoding_dropout,
+        "encoder_dropout": cfg.encoder_dropout,
+        "classifier_dropout": cfg.classifier_dropout,
+        "shortcut_dropout": cfg.shortcut_dropout,
+    }
+    return HTRModel(**model_dict)
 
 
 def build_optimizer(
-    cfg: src.config.OptimAdamwConfig, model: torch.nn.Module, device: torch.device
+    cfg: modular_htr.config.OptimAdamwConfig,
+    model: torch.nn.Module,
+    device: torch.device,
 ) -> tuple[torch.optim.Optimizer, float]:
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -61,18 +74,18 @@ def build_optimizer(
 
 
 def build_scheduler(
-    cfg: src.config.Scheduler,
+    cfg: modular_htr.config.Scheduler,
     optimizer: torch.optim.Optimizer,
     lr: float,
     epochs: int,
     steps_per_epoch: int | None,
 ) -> Scheduler:
-    if isinstance(cfg, src.config.Cosine):
+    if isinstance(cfg, modular_htr.config.Cosine):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer=optimizer, T_max=epochs, eta_min=cfg.eta_min
         )
         return scheduler
-    if isinstance(cfg, src.config.Onecycle):
+    if isinstance(cfg, modular_htr.config.Onecycle):
         if steps_per_epoch is None:
             raise ValueError(
                 "Can't build a OneCycleLR without computing steps_per_epoch."
@@ -88,17 +101,24 @@ def build_scheduler(
             final_div_factor=cfg.final_div_factor,
         )
         return scheduler
-    raise NotImplementedError("Unkown scheduler config")
+    raise NotImplementedError("Unknown scheduler config")
 
 
-def run_training(cfg: src.config.Train) -> None:
+def run_training(cfg: modular_htr.config.Train) -> None:
     set_all_seeds(cfg.seed)
     configure_torch(benchmark=cfg.trainer.torch_benchmark)
     device = get_device()
 
+    fixed_height = cfg.model.fixed_height
+
     ds = get_dataset(cfg.data.dataset)
     text_col = cfg.data.dataset.text_col
-    tokenizer = build_char_tokenizer(ds, text_col, cfg.data.unicode_normalize)
+    tokenizer = build_char_tokenizer(
+        ds,
+        text_col,
+        cfg.data.unicode_normalize,
+        cfg.data.strip_space_before_punctuation,
+    )
 
     print(f"Built the tokenizer with {len(tokenizer)} chars:")
     print(tokenizer.to_dict()["alphabet"])
@@ -109,28 +129,29 @@ def run_training(cfg: src.config.Train) -> None:
         text_col=text_col,
         image_col=cfg.data.dataset.img_col,
         filter_config=cfg.data.width_filters,
-        fixed_height=cfg.data.fixed_height,
+        fixed_height=fixed_height,
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         use_bucketing=cfg.data.use_bucketing,
-        bin_bucket_widths=False,
+        bin_bucket_widths=True,
         pin_memory=device.type != "cpu",
         augmentation=cfg.data.augmentation,
+        invert_image=cfg.data.invert_image,
     )
 
-    model = build_model(
-        cfg.model, num_classes=len(tokenizer), input_height=cfg.data.fixed_height
-    )
+    model = build_model(cfg.model, num_classes=len(tokenizer))
     log_model_info(model)
     model_summary = summary(
         model,
-        input_size=(cfg.data.batch_size, 1, cfg.data.fixed_height, 1000),
+        input_size=(cfg.data.batch_size, 1, fixed_height, 1000),
         col_names=("output_size", "num_params", "kernel_size", "mult_adds"),
         depth=5,
     )
     model.to(device)
     if cfg.trainer.channels_last:
         model = model.to(memory_format=torch.channels_last)  # type: ignore
+
+    # compile is unpractical due to the variable width batches, even with dynamic=True
     # model.backbone = torch.compile(model.backbone, dynamic=True)
 
     epochs = cfg.trainer.epochs
@@ -170,7 +191,7 @@ def run_training(cfg: src.config.Train) -> None:
         cfg=cfg.trainer,
         scheduler=scheduler,
         step_per_batch=step_per_batch,
-        ctc_decoder_mode=cfg.decoder.mode,
+        decoder_cfg=cfg.decoder,
         checkpoint_manager=checkpoint_manager,
         augmentation=cfg.data.augmentation,
     )
@@ -178,7 +199,7 @@ def run_training(cfg: src.config.Train) -> None:
     model, _metrics_history = trainer.fit(train_loader, val_loader)
 
 
-def run_finetune(cfg: src.config.Finetune) -> None:
+def run_finetune(cfg: modular_htr.config.Finetune) -> None:
     set_all_seeds(cfg.seed)
     configure_torch(benchmark=cfg.trainer.torch_benchmark)
     device = get_device()
@@ -197,7 +218,17 @@ def run_finetune(cfg: src.config.Finetune) -> None:
         model = model.to(memory_format=torch.channels_last)  # type: ignore
 
     tokenizer = merged_tokenizer
+    # Allow CLI override of strip_space_before_punctuation (default: inherit from checkpoint).
+    if cfg.data.strip_space_before_punctuation:
+        tokenizer.strip_space_before_punctuation = True
     finetune_ds = apply_ctc_tokenizer(finetune_ds, tokenizer, cfg.data.dataset.text_col)
+
+    # Get fixed_height from the loaded model's config (set during training).
+    fixed_height = model.to_config().get("fixed_height")
+    if fixed_height is None:
+        raise ValueError(
+            "Could not determine fixed_height from checkpoint model config."
+        )
 
     train_loader, val_loader = make_dataloaders(
         finetune_ds,  # type: ignore (should be duck-type compatible)
@@ -205,11 +236,12 @@ def run_finetune(cfg: src.config.Finetune) -> None:
         tokenizer=tokenizer,
         text_col=cfg.data.dataset.text_col,
         image_col=cfg.data.dataset.img_col,
-        fixed_height=cfg.data.fixed_height,
+        fixed_height=fixed_height,
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         use_bucketing=cfg.data.use_bucketing,
         pin_memory=device.type != "cpu",
+        invert_image=cfg.data.invert_image,
     )
 
     epochs = cfg.trainer.epochs
@@ -243,7 +275,7 @@ def run_finetune(cfg: src.config.Finetune) -> None:
         cfg=cfg.trainer,
         scheduler=scheduler,
         step_per_batch=step_per_batch,
-        ctc_decoder_mode=cfg.decoder.mode,
+        decoder_cfg=cfg.decoder,
         checkpoint_manager=checkpoint_manager,
     )
 
@@ -260,27 +292,38 @@ def run_finetune(cfg: src.config.Finetune) -> None:
     )
 
 
-def run_ds_compile(cfg: src.config.CompileDataset):
+def run_ds_compile(cfg: modular_htr.config.CompileDataset):
     build_hf_dataset(cfg.xml_path, cfg.img_path, cfg.out_path)
 
 
 def main():
     cfg = tyro.cli(
-        src.config.Config,  # type: ignore (tyro doesn't get the type alias)
+        modular_htr.config.Config,  # type: ignore (tyro doesn't get the type alias)
         config=(
-            tyro.conf.CascadeSubcommandArgs,
+            # tyro.conf.CascadeSubcommandArgs,
             tyro.conf.FlagConversionOff,
             tyro.conf.EnumChoicesFromValues,
+            tyro.conf.SuppressFixed,
         ),
     )
-    if isinstance(cfg, src.config.Train):
+    if isinstance(cfg, modular_htr.config.Train):
         run_training(cfg)
-    elif isinstance(cfg, src.config.Finetune):
+    elif isinstance(cfg, modular_htr.config.Finetune):
         run_finetune(cfg)
-    elif isinstance(cfg, src.config.CompileDataset):
+    elif isinstance(cfg, modular_htr.config.Evaluate):
+        run_evaluate(cfg)
+    elif isinstance(cfg, modular_htr.config.CompileDataset):
         run_ds_compile(cfg)
-    elif isinstance(cfg, src.config.AnalyseDataset):
+    elif isinstance(cfg, modular_htr.config.AnalyseDataset):
         run_analysis(cfg)
+    elif isinstance(cfg, modular_htr.config.BuildLM):
+        from modular_htr.lm.build import run_build_lm
+
+        run_build_lm(cfg)
+    elif isinstance(cfg, modular_htr.config.InterpolateLM):
+        from modular_htr.lm.build import run_interpolate_lm
+
+        run_interpolate_lm(cfg)
     else:
         print("Don't know what to do.")
 

@@ -1,3 +1,5 @@
+/configs/*
+/lm/*
 /data/*
 /runs/
 # Byte-compiled / optimized / DLL files

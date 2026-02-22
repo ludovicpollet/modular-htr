@@ -8,24 +8,22 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from src.config import Trainer as TrainerConfig
-from src.data.tokenization import CharTokenizer
-from src.data.transforms import GPUAugmentation
-from src.model.CRNN import CRNN
-from src.model.HTRModel import HTRModel
-from src.types import Augmentation, CTCDecoderMode, DebugMode
+from modular_htr.config import CTCDecoder as CTCDecoderConfig
+from modular_htr.config import Trainer as TrainerConfig
+from modular_htr.data.tokenization import CharTokenizer
+from modular_htr.data.transforms import GPUAugmentation
+from modular_htr.model.HTRModel import HTRModel
+from modular_htr.types import Augmentation, CTCDecoderMode, DebugMode
 
 from .ctc import CTCLossWrapper, beam_ctc_decode, build_beam_decoder, greedy_ctc_decode
 from .metrics import cer, wer
 from .utils import CheckpointManager, ScalarMeter, format_metrics, linear_scale
 
-type Model = CRNN | HTRModel
-
 
 class Trainer:
     def __init__(
         self,
-        model: Model,
+        model: HTRModel,
         optimizer: torch.optim.Optimizer,
         loss_fn: CTCLossWrapper,
         device: torch.device,
@@ -33,7 +31,7 @@ class Trainer:
         cfg: TrainerConfig,
         scheduler=None,
         step_per_batch: bool = False,
-        ctc_decoder_mode: CTCDecoderMode | str = CTCDecoderMode.GREEDY,
+        decoder_cfg: CTCDecoderConfig | None = None,
         checkpoint_manager: CheckpointManager | None = None,
         augmentation: Augmentation = Augmentation.NONE,
     ):
@@ -44,9 +42,12 @@ class Trainer:
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.scheduler = scheduler
-        self.ctc_decoder_mode = CTCDecoderMode(ctc_decoder_mode)  # coerce if string
         self.checkpoint_manager = checkpoint_manager
         self.step_per_batch = step_per_batch
+
+        if decoder_cfg is None:
+            decoder_cfg = CTCDecoderConfig()
+        self.ctc_decoder_mode = CTCDecoderMode(decoder_cfg.mode)
 
         self.use_pbars = not self.cfg.disable_pbars
         self.debug_enabled = cfg.debug is not None
@@ -59,12 +60,20 @@ class Trainer:
                 f"tokenizer blank: {self.tokenizer.blank_index}; ctc_loss blank: {self.loss_fn.ctc.blank}"
             )
         self.beam_decoder = None
+        self.beam_temperature = decoder_cfg.temperature
         if self.ctc_decoder_mode is CTCDecoderMode.BEAM:
             if self.tokenizer.blank_index != 0:
                 raise ValueError(
                     "Blank index must be 0 to use the Flashlight beam search decoder."
                 )
-            self.beam_decoder = build_beam_decoder(self.tokenizer)
+            self.beam_decoder = build_beam_decoder(
+                self.tokenizer,
+                beam_size=decoder_cfg.beam_size,
+                lm_path=decoder_cfg.lm_path,
+                lm_weight=decoder_cfg.lm_alpha,
+                word_score=decoder_cfg.word_score,
+                sil_score=decoder_cfg.sil_score,
+            )
 
         self.augment = augmentation is Augmentation.GPU
         if self.augment:
@@ -94,7 +103,7 @@ class Trainer:
             # augment on gpu for the more expensive operations
             if self.augment:
                 images = self.aug_module(images)
-            
+
             if self.cfg.channels_last:
                 images = images.contiguous(memory_format=torch.channels_last)
 
@@ -121,7 +130,9 @@ class Trainer:
                         input_lengths,
                         batch.target_lengths,
                     )
-                    loss_total = loss_main + (linear_scale(self.cfg.epochs, current_epoch) * shortcut_loss)
+                    loss_total = loss_main + (
+                        linear_scale(self.cfg.epochs, current_epoch) * shortcut_loss
+                    )
                     running_loss_main.update(loss_main)
                     running_loss_shortcut.update(shortcut_loss)
                 running_loss.update(loss_total)
@@ -282,7 +293,9 @@ class Trainer:
         hyps = []
 
         iterator = (
-            tqdm(dataloader, desc="Eval", leave=False, dynamic_ncols=True) if self.use_pbars else dataloader
+            tqdm(dataloader, desc="Eval", leave=False, dynamic_ncols=True)
+            if self.use_pbars
+            else dataloader
         )
 
         with torch.inference_mode():
@@ -299,7 +312,11 @@ class Trainer:
                 if compute_error_rates:
                     if self.ctc_decoder_mode is CTCDecoderMode.BEAM:
                         decoded = beam_ctc_decode(
-                            logits, input_lengths, self.beam_decoder, self.tokenizer
+                            logits,
+                            input_lengths,
+                            self.beam_decoder,
+                            self.tokenizer,
+                            temperature=self.beam_temperature,
                         )
                     else:
                         decoded = greedy_ctc_decode(

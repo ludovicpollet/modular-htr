@@ -8,11 +8,17 @@ from typing import Any, Callable, cast
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from datasets import (
+    Dataset,
+    DatasetDict,
+    concatenate_datasets,
+    load_dataset,
+    load_from_disk,
+)
 
-from src import types
-from src import config
-from src.data.tokenization import CharTokenizer
+from modular_htr import types
+from modular_htr import config
+from modular_htr.data.tokenization import CharTokenizer
 
 
 def get_device() -> torch.device:
@@ -51,14 +57,160 @@ def configure_torch(benchmark: bool = True) -> None:
     torch.backends.cudnn.allow_tf32 = True
 
 
-def get_dataset(cfg: config.Dataset) -> Dataset | DatasetDict:
-    """Utility to load a dataset from disk or hub."""
+def normalize_splits(ds: DatasetDict) -> DatasetDict:
+    """Map HF split names to canonical 'train' / 'val'.
+
+    For validation, prefers 'validation' over 'test' when both exist.
+    Returns only recognized splits; unknown names (e.g. 'train_clean') are dropped.
+    The result may contain only 'train' if no val-like split is found.
+    """
+    if "train" not in ds:
+        raise ValueError(f"No 'train' split found. Available: {list(ds.keys())}")
+
+    result = {"train": ds["train"]}
+
+    # Priority: validation > val > test
+    for candidate in ("validation", "val", "test"):
+        if candidate in ds:
+            result["val"] = ds[candidate]
+            break
+
+    return DatasetDict(result)  # type: ignore[call-overload]
+
+
+def get_single_dataset(
+    cfg: config.LocalDataset | config.HubDataset,
+) -> DatasetDict:
+    """Load a single local or hub dataset without split normalization."""
     if isinstance(cfg, config.LocalDataset):
-        return load_from_disk(cfg.path)
-    if isinstance(cfg, config.HubDataset):
+        ds = load_from_disk(cfg.path)
+    elif isinstance(cfg, config.HubDataset):
         # casting to avoid the iterable return types variant
         # to do later, maybe support streaming
-        return cast(Dataset | DatasetDict, load_dataset(cfg.name, streaming=False))
+        ds = cast(DatasetDict, load_dataset(cfg.name, streaming=False))
+    else:
+        raise ValueError(f"Unknown dataset config type: {type(cfg)}")
+
+    if isinstance(ds, Dataset):
+        # Bare dataset without splits — treat as train-only.
+        ds = DatasetDict({"train": ds})
+
+    return ds
+
+
+def _parse_sources(path: pathlib.Path) -> list[config.DatasetSource]:
+    """Read a JSON file and return a list of DatasetSource objects."""
+    with open(path) as f:
+        raw = json.load(f)
+    if not isinstance(raw, list):
+        raise ValueError(f"Expected a JSON array in {path}, got {type(raw).__name__}")
+    return [config.DatasetSource(**item) for item in raw]
+
+
+def _resolve_val_split(
+    ds: DatasetDict, source_name: str, val_split: str | None
+) -> str | None:
+    """Return the concrete validation split name, or None if unavailable.
+
+    "auto" tries validation > val > test in order. None means explicitly no
+    validation. An explicit name must exist or a ValueError is raised.
+    """
+    if val_split is None:
+        return None
+    if val_split == "auto":
+        for candidate in ("validation", "val", "test"):
+            if candidate in ds:
+                return candidate
+        return None
+    if val_split not in ds:
+        raise ValueError(
+            f"Source '{source_name}': requested val_split '{val_split}' "
+            f"not found. Available: {list(ds.keys())}"
+        )
+    return val_split
+
+
+def _normalize_columns(
+    ds: Dataset, img_col: str, text_col: str, source_name: str
+) -> Dataset:
+    """Rename columns to canonical names, add source provenance, drop extras."""
+    # Drop non-essential columns first to avoid rename conflicts.
+    keep = {img_col, text_col}
+    drop = [c for c in ds.column_names if c not in keep]
+    if drop:
+        ds = ds.remove_columns(drop)
+
+    if img_col != "image":
+        ds = ds.rename_column(img_col, "image")
+    if text_col != "text":
+        ds = ds.rename_column(text_col, "text")
+
+    ds = ds.add_column("source", [source_name] * len(ds))
+    return ds
+
+
+def _get_multi_dataset(cfg: config.MultiDataset) -> DatasetDict:
+    """Load and concatenate multiple HF Hub datasets into a single DatasetDict."""
+    sources = _parse_sources(cfg.sources_file)
+    log = tqdm.write
+
+    train_parts: list[Dataset] = []
+    val_parts: list[Dataset] = []
+
+    for src in sources:
+        log(f"Loading {src.name} ...")
+        ds = cast(DatasetDict, load_dataset(src.name, streaming=False))
+        if isinstance(ds, Dataset):
+            ds = DatasetDict({"train": ds})
+
+        # Resolve splits.
+        val_split_name = _resolve_val_split(ds, src.name, src.val_split)
+
+        if src.train_split is not None:
+            if src.train_split not in ds:
+                raise ValueError(
+                    f"Source '{src.name}': train_split '{src.train_split}' "
+                    f"not found. Available: {list(ds.keys())}"
+                )
+            part = _normalize_columns(
+                ds[src.train_split], src.img_col, src.text_col, src.name
+            )
+            train_parts.append(part)
+            log(f"  train: {len(part)} samples")
+
+        if val_split_name is not None:
+            part = _normalize_columns(
+                ds[val_split_name], src.img_col, src.text_col, src.name
+            )
+            val_parts.append(part)
+            log(f"  val ({val_split_name}): {len(part)} samples")
+
+    if not train_parts:
+        raise ValueError(
+            "No training data: none of the sources contributed a train split."
+        )
+
+    result: dict[str, Dataset] = {"train": concatenate_datasets(train_parts)}
+    log(
+        f"Combined train: {len(result['train'])} samples from {len(train_parts)} sources"
+    )
+
+    if val_parts:
+        result["val"] = concatenate_datasets(val_parts)
+        log(f"Combined val: {len(result['val'])} samples from {len(val_parts)} sources")
+
+    return DatasetDict(result)  # type: ignore[call-overload]
+
+
+def get_dataset(cfg: config.Dataset) -> DatasetDict:
+    """Load a dataset from disk or hub and normalize split names."""
+    if isinstance(cfg, config.MultiDataset):
+        return _get_multi_dataset(cfg)
+
+    if isinstance(cfg, (config.LocalDataset, config.HubDataset)):
+        return normalize_splits(get_single_dataset(cfg))
+
+    raise ValueError(f"Unknown dataset config type: {type(cfg)}")
 
 
 def make_log_fn(use_pbar: bool = True) -> Callable[[str], None]:
@@ -94,34 +246,6 @@ def create_run_dir(
     run_dir.mkdir(exist_ok=False)
 
     return run_dir
-
-
-def serialize_optimizer_config(optimizer) -> dict[str, Any]:
-    """
-    Legacy helper. Should not be used anymore.
-    Serialize the live optimizer configuration only for the human readable run config dump: it is not used to restore states.
-    """
-    raise NotImplementedError(
-        "Deprecated function serialize_optimizer_config() is only kept for reference"
-    )
-    opt_config = {
-        "name": optimizer.__class__.__name__,
-        "param_groups": [
-            {
-                "lr": pg.get("lr", optimizer.defaults.get("lr")),
-                "weight_decay": pg.get(
-                    "weight_decay", optimizer.defaults.get("weight_decay")
-                ),
-                "betas": list(
-                    pg.get("betas", optimizer.defaults.get("betas", (None, None)))
-                ),
-                "eps": pg.get("eps", optimizer.defaults.get("eps")),
-                "fused": pg.get("fused", optimizer.defaults.get("fused")),
-            }
-            for pg in optimizer.param_groups
-        ],
-    }
-    return opt_config
 
 
 def dump_config(run_dir: pathlib.Path, run_config: config.Config) -> None:

@@ -6,11 +6,9 @@ from dataclasses import dataclass
 import torch
 
 from .utils import log_model_info
-from src.data.tokenization import CharTokenizer, build_char_tokenizer
-from src.model.CRNN import CRNN
-from src.model.HTRModel import HTRModel
-from src.types import NewHeadInit, NewSymbolsInit
-import torch.nn as nn
+from modular_htr.data.tokenization import CharTokenizer, build_char_tokenizer
+from modular_htr.model.HTRModel import HTRModel
+from modular_htr.types import NewHeadInit, NewSymbolsInit
 
 
 @dataclass
@@ -60,7 +58,12 @@ def merge_tokenizers(
     blank_index = index[blank_token]
     pad_index = index.get(alphabet[pretrained.pad_index], blank_index)
     return CharTokenizer(
-        alphabet=alphabet, index=index, blank_index=blank_index, pad_index=pad_index
+        alphabet=alphabet,
+        index=index,
+        unicode_form=pretrained.unicode_form,
+        blank_index=blank_index,
+        pad_index=pad_index,
+        strip_space_before_punctuation=pretrained.strip_space_before_punctuation,
     )
 
 
@@ -76,7 +79,7 @@ def build_head(
     with torch.no_grad():
         torch.nn.init.zeros_(new_fc.bias)
         if new_class_init is NewSymbolsInit.KAIMING:
-            torch.nn.init.kaiming_uniform(new_fc.weight, a=math.sqrt(5))
+            torch.nn.init.kaiming_uniform_(new_fc.weight, a=math.sqrt(5))
         else:  # ZERO
             new_fc.weight.zero_()
 
@@ -92,12 +95,12 @@ def build_head(
 
 
 def resize_output_layer(
-    model: CRNN | HTRModel,
+    model: HTRModel,
     old_tok: CharTokenizer,
     new_tok: CharTokenizer,
     head_init: NewHeadInit,
     new_class_init: NewSymbolsInit,
-) -> CRNN | HTRModel:
+) -> HTRModel:
     if len(old_tok) == len(new_tok) and head_init is NewHeadInit.COPY:
         return model
 
@@ -124,7 +127,7 @@ def prepare_finetune_model(
     override_config: dict[str, Any] | None = None,
     head_init: NewHeadInit | str = NewHeadInit.COPY,
     new_class_init: NewSymbolsInit | str = NewSymbolsInit.KAIMING,
-) -> tuple[CRNN | HTRModel, CharTokenizer, CharsetDiff]:
+) -> tuple[HTRModel, CharTokenizer, CharsetDiff]:
     """High level convenience to build a model for finetuning from a checkpoint and handle alphabet differences"""
     # coerce eventual strings arguments to enum types
     head_init = NewHeadInit(head_init)
@@ -138,7 +141,11 @@ def prepare_finetune_model(
 
     blank_token = pretrained_tok.alphabet[pretrained_tok.blank_index]
     ft_tok = build_char_tokenizer(
-        finetune_ds, text_col=text_col, blank_token=blank_token
+        finetune_ds,
+        text_col=text_col,
+        unicode_form=pretrained_tok.unicode_form,
+        strip_space_before_punctuation=pretrained_tok.strip_space_before_punctuation,
+        blank_token=blank_token,
     )
     diff = compare_charsets(pretrained_tok, ft_tok)
     merged_tok = merge_tokenizers(pretrained_tok, ft_tok, drop_unused=drop_unused)
@@ -179,8 +186,8 @@ def restore_tokenizer_from_checkpoint(ckpt: dict[str, Any]) -> CharTokenizer | N
 
 def restore_model_from_checkpoint(
     checkpoint: dict[str, Any], device, override_config: dict[str, Any] | None = None
-) -> tuple[CRNN | HTRModel, CharTokenizer | None]:
-    model_cfg = checkpoint.get("model_config") or checkpoint["config"].get("model")
+) -> tuple[HTRModel, CharTokenizer | None]:
+    model_cfg = checkpoint.get("model_config")
     if override_config is not None:
         model_cfg = override_config
     if model_cfg is None:
@@ -197,22 +204,11 @@ def restore_model_from_checkpoint(
         raise ValueError(
             "Could not determine number of output classes to restore model."
         )
-    model_cfg = dict(model_cfg) # copy to avoid mutating the checkpoint itself
-    model_type = model_cfg.pop("model_type", None)
-    if model_type is None:
-        raise ValueError("Missing model_type in checkpoint. Cannot rebuild.")
-    if model_type == "HTRModel":
-        model = HTRModel.from_config(model_cfg, num_classes = num_classes)
-    elif model_type == "crnn":
-        model = CRNN.from_config(model_cfg, num_classes = num_classes)
-    else:
-        raise NotImplementedError("Unknown model_type. Cannot rebuild.")
-    
-    try:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    except RuntimeError as e:
-        print("Could not load model state dict")
-        raise e
+    model_cfg = dict(model_cfg)  # copy to avoid mutating the checkpoint itself
+    model_cfg.pop("model_type", None)
+    model = HTRModel.from_config(model_cfg, num_classes=num_classes)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
     return model, tokenizer
@@ -222,7 +218,7 @@ def load_pretrained_model(
     checkpoint_path: str | Path,
     device: torch.device | str = "cpu",
     override_config: dict[str, Any] | None = None,
-) -> tuple[CRNN | HTRModel, CharTokenizer | None, dict[str, Any]]:
+) -> tuple[HTRModel, CharTokenizer | None, dict[str, Any]]:
     checkpoint = load_checkpoint(checkpoint_path, map_location=device)
     model, tokenizer = restore_model_from_checkpoint(
         checkpoint, device, override_config
@@ -230,55 +226,53 @@ def load_pretrained_model(
     return model, tokenizer, checkpoint
 
 
-def freeze_cnn_stages(model: CRNN | HTRModel, num_stages: int) -> None:
+def freeze_cnn_stages(
+    model: HTRModel, num_stages: int, freeze_stem: bool = True
+) -> None:
     """
     Freeze the first `num_stages` convolutional stages of the model.
-    Supports both the legacy CRNN (uses cnn_stages) and the new HTRModel
-    (uses backbone.stages).
+
+    If `freeze_stem` is True and the backbone has a ``stem`` attribute,
+    the stem parameters are frozen as well.
     """
     log_model_info(model)
-    stages: list[nn.Module] | None = None
-    if hasattr(model, "cnn_stages"):
-        stages_attr = getattr(model, "cnn_stages")
-        if isinstance(stages_attr, (nn.ModuleList, list, tuple)):
-            stages = list(stages_attr)
-    if stages is None and hasattr(model, "backbone"):
-        backbone_stages = getattr(model.backbone, "stages", None)
-        if isinstance(backbone_stages, (nn.ModuleList, list, tuple)):
-            stages = list(backbone_stages)
-    if stages is None:
-        raise TypeError(f"Model of type {type(model)} has no CNN stages to freeze")
+    stages = list(model.backbone.stages)
 
-    for stage in list(stages[:num_stages]):
+    if freeze_stem:
+        stem = getattr(model.backbone, "stem", None)
+        if stem is not None:
+            for p in stem.parameters():
+                p.requires_grad = False
+
+    for stage in stages[:num_stages]:
         for p in stage.parameters():
             p.requires_grad = False
-    
+
     log_model_info(model)
 
 
-def unfreeze_all(model: CRNN) -> None:
+def unfreeze_all(model: HTRModel) -> None:
     for p in model.parameters():
         p.requires_grad = True
 
 
-def make_unfreeze_callback(unfreeze_epoch, num_stages) -> Callable:
+def make_unfreeze_callback(
+    unfreeze_epoch, num_stages, unfreeze_stem: bool = True
+) -> Callable:
     def on_epoch_start(epoch, model):
         if epoch != unfreeze_epoch:
             return
         if num_stages is None:
             unfreeze_all(model)
         else:
-            stages: list[nn.Module] | None = None
-            if hasattr(model, "cnn_stages"):
-                stages_attr = getattr(model, "cnn_stages")
-                if isinstance(stages_attr, (nn.ModuleList, list, tuple)):
-                    stages = list(stages_attr)
-            if stages is None and hasattr(model, "backbone"):
-                backbone_stages = getattr(model.backbone, "stages", None)
-                if isinstance(backbone_stages, (nn.ModuleList, list, tuple)):
-                    stages = list(backbone_stages)
-            if stages is None:
-                raise TypeError(f"Model of type {type(model)} has no CNN stages to unfreeze")
+            stages = list(model.backbone.stages)
+
+            if unfreeze_stem:
+                stem = getattr(model.backbone, "stem", None)
+                if stem is not None:
+                    for p in stem.parameters():
+                        p.requires_grad = True
+
             for stage in stages[:num_stages]:
                 for p in stage.parameters():
                     p.requires_grad = True

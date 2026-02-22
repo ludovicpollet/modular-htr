@@ -1,14 +1,14 @@
+import enum
 from abc import ABC, abstractmethod
-from dataclasses import asdict
 from typing import Literal, Self
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.config import DropoutConfig
-from src.types import HeightCollapseMode, NormType, SequenceEncoderType
+from modular_htr.types import HeightCollapseMode, NormType, SequenceEncoderType
 
+from .ConvNeXt import ConvNeXtBackbone, load_pretrained_timm_weights
 from .MHA import RelBiasTransformerStack
 
 
@@ -184,7 +184,7 @@ class CNNBackbone(nn.Module):
         use_resblock_stack: bool = True,
         use_se: bool = False,
         use_bottleneck_above: int | None = 256,  # None to never use it
-        spatial_dropout: float = 0.0,
+        stage_dropout: list[float] | None = None,
         residual_dropout: float = 0.0,
     ):
         super().__init__()
@@ -194,6 +194,12 @@ class CNNBackbone(nn.Module):
         stage_channels = stage_channels or [32, 32, 64, 64, 128, 128]
         pool_kernels = pool_kernels or [(2, 2), (2, 2), (2, 2), (2, 1)]
         blocks_per_stage = blocks_per_stage or [1] * len(stage_channels)
+
+        if stage_dropout and len(stage_dropout) != len(stage_channels):
+            raise ValueError(
+                f"stage_dropout length ({len(stage_dropout)}) must match "
+                f"conv_channels length ({len(stage_channels)})"
+            )
 
         self.stage_channels = list(stage_channels)
         self.pool_kernels = [tuple(k) for k in pool_kernels]
@@ -256,8 +262,8 @@ class CNNBackbone(nn.Module):
                         )
                     )
 
-            if spatial_dropout > 0:
-                layers.append(nn.Dropout2d(spatial_dropout))
+            if stage_dropout and i < len(stage_dropout) and stage_dropout[i] > 0:
+                layers.append(nn.Dropout2d(stage_dropout[i]))
 
             if i < len(self.pool_kernels):
                 k_h, k_w = self.pool_kernels[i]
@@ -379,6 +385,8 @@ class AttentionHeightCollapse(HeightCollapse):
         attn = self.query(x)  # [B, 1, H, W]
         attn = self.dropout(attn)
         attn = F.softmax(attn / 1.3, dim=2)  # Normalize over height
+        # TODO: expose the magic 1.3 temperature to be set by the caller and added to the config.
+
         out = (x * attn).sum(dim=2)  # [B, C, W]
         return out
 
@@ -582,7 +590,7 @@ def create_sequence_encoder(
     hidden_size: int,
     num_layers: int,
     dropout: float,
-    pos_encoding_dropout: float,
+    pos_encoding_dropout: float,  # legacy configs
     **kwargs,
 ) -> SequenceEncoder:
     """Factory for sequence encoders."""
@@ -601,6 +609,65 @@ def create_sequence_encoder(
     raise ValueError(f"Unknown sequence encoder type: {type}")
 
 
+def create_backbone(
+    backbone_config: dict,
+    in_channels: int,
+) -> CNNBackbone | ConvNeXtBackbone:
+    """Factory to create the appropriate backbone from a config dict.
+
+    Dispatches on backbone_config["backbone_type"]:
+      - "cnn" -> CNNBackbone
+      - "convnext" -> ConvNeXtBackbone
+    """
+    backbone_type = backbone_config.get("backbone_type", "cnn")
+
+    if backbone_type == "convnext":
+        cfg = dict(backbone_config)
+        cfg.pop("backbone_type", None)
+        pretrained = cfg.pop("pretrained", None)
+        backbone = ConvNeXtBackbone(in_channels=in_channels, **cfg)
+        if pretrained:
+            load_pretrained_timm_weights(backbone, pretrained)
+        return backbone
+
+    elif backbone_type == "cnn":
+        cfg = dict(backbone_config)
+        cfg.pop("backbone_type", None)
+        norm_type = cfg.pop("norm_type", NormType.BATCH)
+        residual_dropout = cfg.pop("residual_dropout", 0.0)
+        stage_dropout = cfg.pop("stage_dropout", None)
+
+        return CNNBackbone(
+            in_channels=in_channels,
+            stage_channels=cfg.get("conv_channels"),
+            pool_kernels=cfg.get("pool_kernels"),
+            blocks_per_stage=cfg.get("blocks_per_stage"),
+            norm_type=norm_type,
+            stem_channels=cfg.get("stem_channels") or None,
+            stem_kernel=cfg.get("stem_kernel", 7),
+            use_resblock_stack=cfg.get("use_resblock_stack", True),
+            use_se=cfg.get("squeeze_excitation", False),
+            use_bottleneck_above=cfg.get("use_bottleneck_above"),
+            stage_dropout=stage_dropout,
+            residual_dropout=residual_dropout,
+        )
+
+    raise ValueError(f"Unknown backbone_type: {backbone_type}")
+
+
+def _plain_dict(d: dict) -> dict:
+    """Convert a config dict to plain types safe for torch.save (weights_only)."""
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out[k] = _plain_dict(v)
+        elif isinstance(v, enum.Enum):
+            out[k] = v.value
+        else:
+            out[k] = v
+    return out
+
+
 class HTRModel(nn.Module):
     """
     Modular CNN-RNN architecture for CTC-based text recognition.
@@ -611,75 +678,62 @@ class HTRModel(nn.Module):
 
     def __init__(
         self,
-        img_channels: int,
         num_classes: int,
-        dropout: DropoutConfig,
-        conv_channels: list[int] | None = None,
-        pool_kernels: list[tuple[int, int]] | None = None,
-        blocks_per_stage: list[int] | None = None,
-        stem_channels: int | None = None,
-        stem_kernel: int = 7,
-        use_resblock_stack: bool = False,
-        use_bottleneck_above: int | None = None,
+        backbone_config: dict,
+        img_channels: int = 1,
         hidden_size: int = 256,
         num_layers: int = 3,
         seq_encoder: SequenceEncoderType = SequenceEncoderType.LSTM,
-        norm_type: NormType = NormType.GROUP,
         height_collapse: HeightCollapseMode = HeightCollapseMode.MEAN,
         temporal_convolution: bool = False,
-        squeeze_excitation: bool = False,
-        input_height: int | None = None,
+        fixed_height: int | None = None,
         shortcut_ctc: bool = True,
+        temporal_dropout: float = 0.0,
+        height_attention_dropout: float = 0.0,
+        pos_encoding_dropout: float = 0.0,
+        encoder_dropout: float = 0.0,
+        classifier_dropout: float = 0.0,
+        shortcut_dropout: float = 0.0,
     ):
         super().__init__()
-        self.dropout_conf = dropout
 
         # Store config
+        backbone_for_config = _plain_dict(backbone_config)
+        backbone_for_config.pop("pretrained", None)
         self._config = {
             "model_type": "HTRModel",
             "img_channels": img_channels,
             "num_classes": num_classes,
-            "conv_channels": conv_channels,
-            "pool_kernels": pool_kernels,
-            "blocks_per_stage": blocks_per_stage,
-            "stem_channels": stem_channels,
-            "stem_kernel": stem_kernel,
-            "use_resblock_stack": use_resblock_stack,
-            "use_bottleneck_above": use_bottleneck_above,
+            "backbone": backbone_for_config,
             "hidden_size": hidden_size,
             "num_layers": num_layers,
-            "dropout": asdict(self.dropout_conf),
+            "temporal_dropout": temporal_dropout,
+            "height_attention_dropout": height_attention_dropout,
+            "pos_encoding_dropout": pos_encoding_dropout,
+            "encoder_dropout": encoder_dropout,
+            "classifier_dropout": classifier_dropout,
+            "shortcut_dropout": shortcut_dropout,
             "seq_encoder": seq_encoder.value,
-            "norm_type": norm_type.value,
             "height_collapse": height_collapse.value,
             "temporal_convolution": temporal_convolution,
-            "squeeze_excitation": squeeze_excitation,
-            "input_height": input_height,
+            "fixed_height": fixed_height,
             "shortcut_ctc": shortcut_ctc,
         }
 
-        # CNN backbone
-        self.backbone = CNNBackbone(
+        # CNN backbone (dispatched via factory)
+        self.backbone = create_backbone(
+            backbone_config,
             in_channels=img_channels,
-            stage_channels=conv_channels,
-            stem_channels=stem_channels,
-            blocks_per_stage=blocks_per_stage,
-            use_resblock_stack=use_resblock_stack,
-            pool_kernels=pool_kernels,
-            norm_type=norm_type,
-            use_se=squeeze_excitation,
-            spatial_dropout=self.dropout_conf.conv,
-            residual_dropout=self.dropout_conf.residual,
         )
         feature_size = self.backbone.out_channels
 
         # Height collapse
         collapsed_height = None
-        if input_height is not None:
-            collapsed_height = input_height // self.backbone.height_reduction
+        if fixed_height is not None:
+            collapsed_height = fixed_height // self.backbone.height_reduction
             if collapsed_height < 1:
                 raise ValueError(
-                    f"input_height={input_height} too small for pooling "
+                    f"fixed_height={fixed_height} too small for pooling "
                     f"(reduction={self.backbone.height_reduction})"
                 )
 
@@ -687,10 +741,13 @@ class HTRModel(nn.Module):
             height_collapse,
             feature_size,
             collapsed_height,
-            dropout=self.dropout_conf.height_attention,
+            dropout=height_attention_dropout,
         )
 
         if shortcut_ctc:
+            self.shortcut_dropout_layer = (
+                nn.Dropout(shortcut_dropout) if shortcut_dropout > 0 else nn.Identity()
+            )
             self.shortcut_head = nn.Conv1d(
                 feature_size, num_classes, kernel_size=3, padding=1
             )
@@ -699,7 +756,7 @@ class HTRModel(nn.Module):
         self.temporal_conv_layer: TemporalConvBlock | None = None
         if temporal_convolution:
             self.temporal_conv_layer = TemporalConvBlock(
-                feature_size, dropout=self.dropout_conf.temporal
+                feature_size, dropout=temporal_dropout
             )
 
         # Sequence encoder
@@ -708,12 +765,12 @@ class HTRModel(nn.Module):
             input_size=feature_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            dropout=self.dropout_conf.encoder,
-            pos_encoding_dropout=self.dropout_conf.pos_encoding,
+            dropout=encoder_dropout,
+            pos_encoding_dropout=pos_encoding_dropout,
         )
 
         # Output projection
-        self.dropout_layer = nn.Dropout(self.dropout_conf.classifier)
+        self.dropout_layer = nn.Dropout(classifier_dropout)
         self.fc = nn.Linear(self.seq_encoder.output_size, num_classes)
 
         # Expose for external use
@@ -731,7 +788,7 @@ class HTRModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         x: Input images [B, C, H, W]
-        Returns Logits [T, B, num_classes] for CTC loss, Logits [same] for shortcut CTC loss
+        Returns Logits [T, B, num_classes] for CTC loss, logits [same] for shortcut CTC loss
         """
         # CNN features: [B, C, H, W] -> [B, Cf, Hc, Wc]
         features = self.backbone(x)
@@ -741,7 +798,8 @@ class HTRModel(nn.Module):
 
         shortcut_logits = None
         if hasattr(self, "shortcut_head"):
-            shortcut_logits = self.shortcut_head(features)
+            shortcut_logits = self.shortcut_dropout_layer(features)
+            shortcut_logits = self.shortcut_head(shortcut_logits)
             shortcut_logits = shortcut_logits.permute(2, 0, 1)
 
         # Temporal conv: [B, Cf, T]
@@ -772,36 +830,37 @@ class HTRModel(nn.Module):
 
     @classmethod
     def from_config(
-        cls, config: dict, *, num_classes: int, input_height: int | None = None
+        cls, config: dict, *, num_classes: int, fixed_height: int | None = None
     ) -> Self:
         """Create model from configuration dict."""
         config = config.copy()
-        saved_height = config.get("input_height")
+
+        saved_height = config.get("fixed_height")
         if (
-            input_height is not None
+            fixed_height is not None
             and saved_height is not None
-            and input_height != saved_height
+            and fixed_height != saved_height
         ):
-            config["input_height"] = input_height
+            config["fixed_height"] = fixed_height
             print(
-                f"[WARNING] Model was trained with input height {saved_height}; rebuilding with {input_height}."
+                f"[WARNING] Model was trained with fixed height {saved_height}; rebuilding with {fixed_height}."
             )
-        if input_height is not None:
-            config["input_height"] = input_height
+        if fixed_height is not None:
+            config["fixed_height"] = fixed_height
         elif saved_height is not None:
             pass  # already in
         else:
-            raise ValueError("Missing input_height (needs to be passed if not stored).")
+            raise ValueError("Missing fixed_height (needs to be passed if not stored).")
 
         config["num_classes"] = num_classes
         # Remove computed values that aren't constructor args
         config.pop("time_reduction", None)
         config.pop("height_reduction", None)
+        config.pop("model_type", None)
         # rewrap enums if they're strings
         config["seq_encoder"] = SequenceEncoderType(config["seq_encoder"])
-        config["norm_type"] = NormType(config["norm_type"])
         config["height_collapse"] = HeightCollapseMode(config["height_collapse"])
-        # rebuild DropoutConfig if it's a dict
-        if isinstance(config.get("dropout"), dict):
-            config["dropout"] = DropoutConfig(**config["dropout"])
+        # Config stores "backbone" but __init__ expects "backbone_config"
+        if "backbone" in config:
+            config["backbone_config"] = config.pop("backbone")
         return cls(**config)

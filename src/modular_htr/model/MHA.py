@@ -76,7 +76,7 @@ class MHAWithRelSinBias(nn.Module):
     ) -> torch.Tensor:
         """
         x: [B,T,D]
-        key_padding_mask: [B,T] True=PAD
+        key_padding_mask: [B,T] (True=PAD)
         """
         B, T, D = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
@@ -145,7 +145,9 @@ class RelBiasEncoderLayer(nn.Module):
 
 class RelBiasTransformerStack(nn.Module):
     """
-    A transformer stack with relative sinusoidal positional encoding (bias only), to try and match the architecture proposed by Diaz et al. in the "Rethinking Text Line Recognition Models" (2021) paper.
+    A transformer stack with relative sinusoidal positional encoding (bias only),
+    to try and match the architecture proposed by Diaz et al. in the
+    "Rethinking Text Line Recognition Models" (2021) paper.
     """
 
     def __init__(

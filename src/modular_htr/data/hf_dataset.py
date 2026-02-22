@@ -17,7 +17,7 @@ def build_hf_dataset(xml_root, img_root, out_dir):
         ),  # wrap in lambda to use parameters
         features=features,
     )
-    ds = ds.train_test_split(test_size=0.1, seed=42) #type: ignore
+    ds = ds.train_test_split(test_size=0.1, seed=42)  # type: ignore
     ds.save_to_disk(out_dir)
     return ds
 

@@ -6,7 +6,7 @@ import torch
 from torchvision.transforms import v2
 from torchvision.transforms.functional import to_tensor
 
-from .tokenization import CharTokenizer
+from .tokenization import CharTokenizer, normalize_text
 
 
 class GPUAugmentation:
@@ -18,21 +18,22 @@ class GPUAugmentation:
     def __init__(self, device: torch.device):
         self.module = K.AugmentationSequential(
             K.RandomAffine(
-                degrees=5,
+                degrees=1,
                 translate=(0.02, 0.02),
-                scale=(0.95, 1.05),
-                shear=3,
-                p=0.8,
+                scale=(0.6, 1.2),
+                shear=(-30, 30, -5, 5),  # type: ignore (tested, works)
+                p=0.5,
             ),
             K.RandomElasticTransform(
-                kernel_size=(19, 19),
-                sigma=(5.0, 5.0),
-                alpha=(0.2, 0.8),
-                p=0.2,
+                kernel_size=(49, 49),
+                sigma=(13.0, 13.0),
+                alpha=(0.6, 0.6),
+                p=0.25,
             ),
             K.RandomGaussianBlur((3, 3), (0.1, 1.0), p=0.1),
-            K.RandomBrightness((0.8, 1.2), p=0.4),
+            K.RandomBrightness((0.8, 1.2), p=0.5),
             K.RandomContrast((0.6, 1.0), p=0.4),
+            K.RandomGamma((0.8, 1.2), p=0.5),
             data_keys=["input"],
             same_on_batch=False,
         ).to(device)
@@ -72,8 +73,12 @@ def make_preprocessing_fn(
         # resize
         img = resize_keep_aspect(img, fixed_height)
 
-        # tokenization
-        text = example[text_col]
+        # normalize text to match the tokenizer's alphabet, then tokenize
+        text = normalize_text(
+            example[text_col],
+            tokenizer.unicode_form,
+            tokenizer.strip_space_before_punctuation,
+        )
         labels = tokenizer.encode(text)
 
         return {
@@ -81,15 +86,17 @@ def make_preprocessing_fn(
             "width": img.size[0],
             "labels": labels,
             "label_length": len(labels),
+            "text": text,
         }
 
     return _preprocess
 
 
-def make_runtime_transform(augment: bool = False) -> Callable:
+def make_runtime_transform(augment: bool = False, invert: bool = False) -> Callable:
     """
-    Returns the training transforms: to_tensor, and optionnaly the lighter augmentations that can run on CPU.
+    Returns the training transforms: to_tensor, and optionally the lighter augmentations that can run on CPU.
     The caller must not set augment=True if the GPU augmentation pipeline is in use.
+    If invert is True, pixel values are flipped (1.0 - t) so strokes become bright and background dark.
     """
     aug = None
     if augment:
@@ -101,6 +108,7 @@ def make_runtime_transform(augment: bool = False) -> Callable:
                     scale=(0.95, 1.05),
                     shear=(-3, 3),
                 ),
+                # Elastic is too slow on CPU
                 # v2.RandomApply([v2.ElasticTransform(alpha=50.0, sigma=5.0)], p=0.4),
                 v2.RandomPerspective(distortion_scale=0.1, p=0.2),
                 v2.RandomApply([v2.GaussianBlur(kernel_size=3)], p=0.3),
@@ -113,7 +121,10 @@ def make_runtime_transform(augment: bool = False) -> Callable:
         for img in batch["image"]:
             if aug is not None:
                 img = aug(img)
-            images.append(to_tensor(img))
+            t = to_tensor(img)
+            if invert:
+                t = 1.0 - t
+            images.append(t)
         batch["image"] = images
         return batch
 

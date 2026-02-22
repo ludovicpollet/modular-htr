@@ -1,3 +1,4 @@
+import re
 import unicodedata
 import collections
 from dataclasses import dataclass
@@ -5,10 +6,26 @@ from typing import Any
 
 import datasets
 
-from src.types import UnicodeForm
+from modular_htr.types import UnicodeForm
+
+_MULTI_WHITESPACE = re.compile(r"\s+")
 
 type Alphabet = list[str]
 type Index = dict[str, int]
+
+
+def _strip_space_before_punct(text: str) -> str:
+    """Remove whitespace immediately before punctuation characters."""
+    result = []
+    for i, c in enumerate(text):
+        if (
+            c == " "
+            and i + 1 < len(text)
+            and unicodedata.category(text[i + 1])[0] == "P"
+        ):
+            continue
+        result.append(c)
+    return "".join(result)
 
 
 @dataclass
@@ -18,9 +35,12 @@ class CharTokenizer:
     unicode_form: UnicodeForm | None
     blank_index: int
     pad_index: int
+    strip_space_before_punctuation: bool = False
 
     def encode(self, text: str) -> list[int]:
-        text = normalize_text(text, self.unicode_form)
+        text = normalize_text(
+            text, self.unicode_form, self.strip_space_before_punctuation
+        )
         return [self.index[c] for c in text if c in self.index]
 
     def decode(self, ids: list[int]) -> str:
@@ -41,6 +61,7 @@ class CharTokenizer:
             "unicode_form": self.unicode_form.value
             if self.unicode_form is not None
             else None,
+            "strip_space_before_punctuation": self.strip_space_before_punctuation,
         }
 
     @classmethod
@@ -64,6 +85,9 @@ class CharTokenizer:
         unicode_form = (
             UnicodeForm(unicode_form_str) if unicode_form_str is not None else None
         )
+        strip_space_before_punctuation = data.get(
+            "strip_space_before_punctuation", False
+        )
 
         return cls(
             alphabet=alphabet,
@@ -71,18 +95,33 @@ class CharTokenizer:
             index=index,
             blank_index=blank_index,
             pad_index=pad_index,
+            strip_space_before_punctuation=strip_space_before_punctuation,
         )
 
 
-def normalize_text(text: str, unicode_form: UnicodeForm | None) -> str:
+def normalize_text(
+    text: str,
+    unicode_form: UnicodeForm | None,
+    strip_space_before_punctuation: bool = False,
+) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = _MULTI_WHITESPACE.sub(" ", text).strip()
+    if strip_space_before_punctuation:
+        text = _strip_space_before_punct(text)
     if unicode_form is not None:
         text = unicodedata.normalize(unicode_form.value, text)
     return text
 
 
-def _count_batch(batch, text_col, unicode_form):
+def _count_batch(batch, text_col, unicode_form, strip_space_before_punctuation):
     return {
-        "chars": ["".join(normalize_text(t, unicode_form) for t in batch[text_col])]
+        "chars": [
+            "".join(
+                normalize_text(t, unicode_form, strip_space_before_punctuation)
+                for t in batch[text_col]
+            )
+        ]
     }
 
 
@@ -90,6 +129,7 @@ def build_char_tokenizer(
     ds: datasets.Dataset | datasets.DatasetDict,
     text_col: str = "text",
     unicode_form: UnicodeForm | None = None,
+    strip_space_before_punctuation: bool = False,
     splits: str = "all",
     blank_token: str = "<blank>",
     num_proc: int = 16,
@@ -108,7 +148,11 @@ def build_char_tokenizer(
     for split_ds in iterables:
         tmp = split_ds.map(
             _count_batch,
-            fn_kwargs={"text_col": text_col, "unicode_form": unicode_form},
+            fn_kwargs={
+                "text_col": text_col,
+                "unicode_form": unicode_form,
+                "strip_space_before_punctuation": strip_space_before_punctuation,
+            },
             batched=True,
             batch_size=1000,
             num_proc=num_proc,
@@ -131,6 +175,7 @@ def build_char_tokenizer(
         unicode_form=unicode_form,
         blank_index=blank_index,
         pad_index=pad_index,
+        strip_space_before_punctuation=strip_space_before_punctuation,
     )
 
 

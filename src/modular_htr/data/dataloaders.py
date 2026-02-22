@@ -1,16 +1,18 @@
 import math
-import random
 import os
+import random
 from dataclasses import dataclass
 
-import numpy as np
 import datasets
+import numpy as np
 import torch
 
-from .transforms import make_preprocessing_fn, make_runtime_transform
+from modular_htr.config import WidthFilters
+from modular_htr.types import Augmentation
+
 from .tokenization import CharTokenizer
-from src.types import Augmentation
-from src.config import WidthFilters
+from .transforms import make_preprocessing_fn, make_runtime_transform
+
 
 @dataclass(slots=True)
 class Batch:
@@ -91,7 +93,10 @@ class BucketByWidthSampler(torch.utils.data.Sampler):
     def __iter__(self):
         indices = self.indices.copy()
 
-        batches = [indices[i:i+self.batch_size] for i in range(0, len(indices), self.batch_size)]
+        batches = [
+            indices[i : i + self.batch_size]
+            for i in range(0, len(indices), self.batch_size)
+        ]
 
         if self.shuffle:
             random.shuffle(batches)
@@ -111,27 +116,23 @@ def _compute_resized_width(batch, fixed_height):
 
 
 def _ensure_widths(ds, fixed_height, num_proc=None):
-    if "width" in ds["train"].column_names and "width" in ds["test"].column_names:
+    """
+    Deprecated helper.
+    """
+    if all("width" in ds[split].column_names for split in ds):
         return ds
     num_proc = num_proc or min(os.cpu_count() or 1, 16)
     return datasets.DatasetDict(
         {
-            "train": ds["train"].map(
+            split: ds[split].map(
                 _compute_resized_width,
                 fn_kwargs={"fixed_height": fixed_height},
                 batched=True,
                 batch_size=1024,
                 num_proc=num_proc,
-                desc=(f"Getting widths for height {fixed_height} in split 'train'")
-            ),
-            "test": ds["test"].map(
-                _compute_resized_width,
-                fn_kwargs={"fixed_height": fixed_height},
-                batched=True,
-                batch_size=1024,
-                num_proc=num_proc,
-                desc=(f"Getting widths for height {fixed_height} in split 'test'")
-            ),
+                desc=f"Getting widths for height {fixed_height} in split '{split}'",
+            )
+            for split in ds
         }
     )
 
@@ -153,7 +154,7 @@ def _apply_size_filter(
 ) -> datasets.Dataset:
     """
     Filter overly large images for memory efficiency.
-    Will remove those batches that come from hell with huge memory impact and potentially a lot of padding.
+    Should get rid of batches with huge memory impact, and broken ultra large images.
     Applied once during dataset preparation.
     """
     if not config.filter_large_images:
@@ -204,9 +205,9 @@ def _apply_ctc_filter(
 
     diff = original_len - len(ds)
     print(f"[{split_name}] CTC filter: {original_len} → {len(ds)}")
-    print(f"stride={config.time_reduction_factor}, margin={config.ctc_margin})")
+    print(f"stride={config.time_reduction_factor}, margin={config.ctc_margin}")
     if diff > 0:
-          print(f"(removed {diff})")
+        print(f"(removed {diff})")
     else:
         print("Nothing to remove.")
     return ds
@@ -231,7 +232,7 @@ def _preprocess_split(
         fixed_height=fixed_height,
         tokenizer=tokenizer,
         text_col=text_col,
-        image_col=image_col
+        image_col=image_col,
     )
 
     ds = ds.map(
@@ -245,6 +246,7 @@ def _preprocess_split(
     ds = _apply_ctc_filter(ds, filter_config, split_name)
 
     return ds
+
 
 def make_dataloaders(
     ds: datasets.DatasetDict,
@@ -260,34 +262,54 @@ def make_dataloaders(
     pin_memory: bool = True,
     prefetch_factor: int = 2,
     augmentation: Augmentation = Augmentation.NONE,
+    invert_image: bool = False,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """High level convenience to build DataLoaders from a HF DatasetDict"""
     if not isinstance(ds, datasets.DatasetDict):
         raise TypeError(
-            "make_dataloaders expects a datasets.DatasetDict with train/test splits."
+            "make_dataloaders expects a datasets.DatasetDict with train/val splits."
         )
-    if "train" not in ds or "test" not in ds:
-        raise KeyError("DatasetDict must contain at least 'train' and 'test' splits.")
+    if "train" not in ds or "val" not in ds:
+        raise KeyError("DatasetDict must contain 'train' and 'val' splits.")
 
+    ds = datasets.DatasetDict(
+        {
+            "train": _preprocess_split(
+                ds["train"],
+                fixed_height,
+                tokenizer,
+                text_col,
+                image_col,
+                filter_config,
+                "train",
+                num_proc=num_workers,
+            ),
+            "val": _preprocess_split(
+                ds["val"],
+                fixed_height,
+                tokenizer,
+                text_col,
+                image_col,
+                filter_config,
+                "val",
+                num_proc=num_workers,
+            ),
+        }
+    )
 
-    ds = datasets.DatasetDict({
-        "train": _preprocess_split(ds["train"], fixed_height, tokenizer, text_col, image_col, filter_config, "train", num_proc=num_workers),
-        "test": _preprocess_split(ds["test"], fixed_height, tokenizer, text_col, image_col, filter_config, "test", num_proc=num_workers)
-    })
-
-
-    bucket_bin = 64 if (torch.backends.cudnn.benchmark or bin_bucket_widths) else None
+    bucket_bin = 256 if (torch.backends.cudnn.benchmark or bin_bucket_widths) else None
     widths_train = _bucket_widths(ds["train"]["width"], bin_size=bucket_bin)
 
     train_transform = make_runtime_transform(
-        augment=augmentation is Augmentation.CPU
+        augment=augmentation is Augmentation.CPU,
+        invert=invert_image,
     )
-    test_transform = make_runtime_transform(augment=False)
+    val_transform = make_runtime_transform(augment=False, invert=invert_image)
 
     ds = datasets.DatasetDict(
         {
             "train": ds["train"].with_transform(train_transform),
-            "test": ds["test"].with_transform(test_transform),
+            "val": ds["val"].with_transform(val_transform),
         }
     )
 
@@ -321,10 +343,10 @@ def make_dataloaders(
             **loader_kwargs,  # type: ignore
         )
 
-    test_loader = torch.utils.data.DataLoader(
-        ds["test"],  # type: ignore[arg-type]
+    val_loader = torch.utils.data.DataLoader(
+        ds["val"],  # type: ignore[arg-type]
         batch_size=batch_size,
         shuffle=False,
         **loader_kwargs,  # type: ignore
     )
-    return train_loader, test_loader
+    return train_loader, val_loader
