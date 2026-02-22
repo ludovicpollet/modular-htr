@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import PIL.Image
-from lxml import etree
+from lxml import etree  # type: ignore[import-untyped]
 
 ALLOWED_EXTS = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 
@@ -54,7 +54,7 @@ def find_matching_image(xml_path, img_root):
 def stream_examples_from_xml(xml_root, img_root, convert_L=True):
     xml_root, img_root = Path(xml_root), Path(img_root)
     for xml_path in xml_root.rglob("*.xml"):
-        if xml_path.stem == "mets":
+        if xml_path.stem.lower() == "mets":
             continue
 
         img_path = find_matching_image(xml_path, img_root)
@@ -67,5 +67,3 @@ def stream_examples_from_xml(xml_root, img_root, convert_L=True):
                 line_id = f"{xml_path.stem}_{line['line_id']:03d}"
 
                 yield {"id": line_id, "image": line_img, "text": line["text"]}
-
-

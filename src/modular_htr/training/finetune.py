@@ -5,8 +5,10 @@ from dataclasses import dataclass
 
 import torch
 
-from src.data.tokenization import CharTokenizer, build_char_tokenizer
-from src.model.CRNN import CRNN
+from .utils import log_model_info
+from modular_htr.data.tokenization import CharTokenizer, build_char_tokenizer
+from modular_htr.model.HTRModel import HTRModel
+from modular_htr.types import NewHeadInit, NewSymbolsInit
 
 
 @dataclass
@@ -56,7 +58,12 @@ def merge_tokenizers(
     blank_index = index[blank_token]
     pad_index = index.get(alphabet[pretrained.pad_index], blank_index)
     return CharTokenizer(
-        alphabet=alphabet, index=index, blank_index=blank_index, pad_index=pad_index
+        alphabet=alphabet,
+        index=index,
+        unicode_form=pretrained.unicode_form,
+        blank_index=blank_index,
+        pad_index=pad_index,
+        strip_space_before_punctuation=pretrained.strip_space_before_punctuation,
     )
 
 
@@ -65,41 +72,36 @@ def build_head(
     old_tok,
     new_tok,
     device,
-    head_init: str = "copy",
-    new_class_init: str = "zero",
+    head_init: NewHeadInit,
+    new_class_init: NewSymbolsInit,
 ):
-    if head_init not in {"copy", "reset"}:
-        raise ValueError(f"Unknown head_init strategy: {head_init}")
-    if new_class_init not in {"zero", "kaiming"}:
-        raise ValueError(f"Unknown new_class_init strategy: {new_class_init}")
-
     new_fc = torch.nn.Linear(old_fc.in_features, len(new_tok), device=device)
     with torch.no_grad():
         torch.nn.init.zeros_(new_fc.bias)
-        if new_class_init == "kaiming":
-            torch.nn.init.kaiming_uniform(new_fc.weight, a=math.sqrt(5))
-        else:
+        if new_class_init is NewSymbolsInit.KAIMING:
+            torch.nn.init.kaiming_uniform_(new_fc.weight, a=math.sqrt(5))
+        else:  # ZERO
             new_fc.weight.zero_()
 
-        if head_init == "copy":
+        if head_init is NewHeadInit.COPY:
             for ch, old_idx in old_tok.index.items():
                 if ch not in new_tok.index:
                     continue
                 new_idx = new_tok.index[ch]
                 new_fc.weight[new_idx] = old_fc.weight[old_idx]
                 new_fc.bias[new_idx] = old_fc.bias[old_idx]
-        # the head_init == "reset" case is handled by the zero init above
+        # the RESET case is handled by the zero init above
     return new_fc
 
 
 def resize_output_layer(
-    model: CRNN,
+    model: HTRModel,
     old_tok: CharTokenizer,
     new_tok: CharTokenizer,
-    head_init: str = "copy",
-    new_class_init: str = "zero",
-) -> CRNN:
-    if len(old_tok) == len(new_tok) and head_init == "copy":
+    head_init: NewHeadInit,
+    new_class_init: NewSymbolsInit,
+) -> HTRModel:
+    if len(old_tok) == len(new_tok) and head_init is NewHeadInit.COPY:
         return model
 
     device = next(model.parameters()).device  # keep new head on the same device
@@ -123,9 +125,14 @@ def prepare_finetune_model(
     device: torch.device | str = "cpu",
     drop_unused: bool = False,
     override_config: dict[str, Any] | None = None,
-    head_init: str = "copy",
-    new_class_init: str = "zero",
-) -> tuple[CRNN, CharTokenizer, CharsetDiff]:
+    head_init: NewHeadInit | str = NewHeadInit.COPY,
+    new_class_init: NewSymbolsInit | str = NewSymbolsInit.KAIMING,
+) -> tuple[HTRModel, CharTokenizer, CharsetDiff]:
+    """High level convenience to build a model for finetuning from a checkpoint and handle alphabet differences"""
+    # coerce eventual strings arguments to enum types
+    head_init = NewHeadInit(head_init)
+    new_class_init = NewSymbolsInit(new_class_init)
+
     model, pretrained_tok, _ckpt = load_pretrained_model(
         checkpoint_path, device=device, override_config=override_config
     )
@@ -134,7 +141,11 @@ def prepare_finetune_model(
 
     blank_token = pretrained_tok.alphabet[pretrained_tok.blank_index]
     ft_tok = build_char_tokenizer(
-        finetune_ds, text_col=text_col, blank_token=blank_token
+        finetune_ds,
+        text_col=text_col,
+        unicode_form=pretrained_tok.unicode_form,
+        strip_space_before_punctuation=pretrained_tok.strip_space_before_punctuation,
+        blank_token=blank_token,
     )
     diff = compare_charsets(pretrained_tok, ft_tok)
     merged_tok = merge_tokenizers(pretrained_tok, ft_tok, drop_unused=drop_unused)
@@ -175,8 +186,8 @@ def restore_tokenizer_from_checkpoint(ckpt: dict[str, Any]) -> CharTokenizer | N
 
 def restore_model_from_checkpoint(
     checkpoint: dict[str, Any], device, override_config: dict[str, Any] | None = None
-) -> tuple[CRNN, CharTokenizer | None]:
-    model_cfg = checkpoint.get("model_config") or checkpoint["config"].get("model")
+) -> tuple[HTRModel, CharTokenizer | None]:
+    model_cfg = checkpoint.get("model_config")
     if override_config is not None:
         model_cfg = override_config
     if model_cfg is None:
@@ -188,37 +199,16 @@ def restore_model_from_checkpoint(
             "Warning: Checkpoint is missing a tokenizer. Will infer num_classes from model size."
         )
 
-    try:
-        conv_channels = model_cfg["conv_channels"]
-        pool_kernels = [tuple(k) for k in model_cfg["pool_kernels"]]
-        rnn_hidden = model_cfg["rnn_hidden"]
-        dropout = model_cfg["dropout"]
-        rnn_layers = model_cfg["rnn_layers"]
-        img_channels = model_cfg["img_channels"]
-    except KeyError as e:
-        raise ValueError(f"Checkpoint model config is missing key: {e.args[0]}") from e
-
     num_classes = len(tokenizer) if tokenizer else model_cfg.get("num_classes")
     if num_classes is None:
         raise ValueError(
             "Could not determine number of output classes to restore model."
         )
+    model_cfg = dict(model_cfg)  # copy to avoid mutating the checkpoint itself
+    model_cfg.pop("model_type", None)
+    model = HTRModel.from_config(model_cfg, num_classes=num_classes)
 
-    model = CRNN(
-        img_channels=img_channels,
-        num_classes=num_classes,
-        rnn_layers=rnn_layers,
-        conv_channels=conv_channels,
-        pool_kernels=pool_kernels,
-        rnn_hidden=rnn_hidden,
-        dropout=dropout,
-    )
-
-    try:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    except RuntimeError as e:
-        print("Could not load model")
-        raise e
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
     return model, tokenizer
@@ -228,7 +218,7 @@ def load_pretrained_model(
     checkpoint_path: str | Path,
     device: torch.device | str = "cpu",
     override_config: dict[str, Any] | None = None,
-) -> tuple[CRNN, CharTokenizer | None, dict[str, Any]]:
+) -> tuple[HTRModel, CharTokenizer | None, dict[str, Any]]:
     checkpoint = load_checkpoint(checkpoint_path, map_location=device)
     model, tokenizer = restore_model_from_checkpoint(
         checkpoint, device, override_config
@@ -236,26 +226,56 @@ def load_pretrained_model(
     return model, tokenizer, checkpoint
 
 
-def freeze_cnn_stages(model: CRNN, num_stages: int) -> None:
-    for stage in list(model.cnn_stages[:num_stages]):
+def freeze_cnn_stages(
+    model: HTRModel, num_stages: int, freeze_stem: bool = True
+) -> None:
+    """
+    Freeze the first `num_stages` convolutional stages of the model.
+
+    If `freeze_stem` is True and the backbone has a ``stem`` attribute,
+    the stem parameters are frozen as well.
+    """
+    log_model_info(model)
+    stages = list(model.backbone.stages)
+
+    if freeze_stem:
+        stem = getattr(model.backbone, "stem", None)
+        if stem is not None:
+            for p in stem.parameters():
+                p.requires_grad = False
+
+    for stage in stages[:num_stages]:
         for p in stage.parameters():
             p.requires_grad = False
 
+    log_model_info(model)
 
-def unfreeze_all(model: CRNN) -> None:
+
+def unfreeze_all(model: HTRModel) -> None:
     for p in model.parameters():
         p.requires_grad = True
 
 
-def make_unfreeze_callback(unfreeze_epoch, num_stages) -> Callable:
+def make_unfreeze_callback(
+    unfreeze_epoch, num_stages, unfreeze_stem: bool = True
+) -> Callable:
     def on_epoch_start(epoch, model):
         if epoch != unfreeze_epoch:
             return
         if num_stages is None:
             unfreeze_all(model)
         else:
-            for stage in model.cnn_stages[:num_stages]:
+            stages = list(model.backbone.stages)
+
+            if unfreeze_stem:
+                stem = getattr(model.backbone, "stem", None)
+                if stem is not None:
+                    for p in stem.parameters():
+                        p.requires_grad = True
+
+            for stage in stages[:num_stages]:
                 for p in stage.parameters():
                     p.requires_grad = True
+        log_model_info(model)
 
     return on_epoch_start
