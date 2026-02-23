@@ -1,4 +1,5 @@
 import json
+import logging
 import statistics
 from collections import Counter
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from modular_htr.training.metrics import (
 )
 from modular_htr.training.utils import get_device, get_single_dataset
 from modular_htr.types import CTCDecoderMode
+
+logger = logging.getLogger(__name__)
 
 type ConfusionKey = tuple[str, str | None, str | None]
 
@@ -100,7 +103,7 @@ def prepare_eval(
 
     split_ds = ds[cfg.split]
     split_size = len(split_ds)
-    print(f"Evaluating on split '{cfg.split}': {len(split_ds)} samples")
+    logger.info("Evaluating on split '%s': %d samples", cfg.split, len(split_ds))
 
     split_ds = _preprocess_split(
         split_ds,
@@ -378,8 +381,8 @@ def write_report_json(report: EvalReport, cfg: config.Evaluate) -> None:
 
 def run_evaluate(cfg: config.Evaluate) -> None:
     device, model, tokenizer, loader, dataset_label, split_size = prepare_eval(cfg)
-    print(f"Device: {device}")
-    print(f"Evaluating on split '{cfg.split}': {split_size} samples")
+    logger.info("Device: %s", device)
+    logger.info("Evaluating on split '%s': %d samples", cfg.split, split_size)
 
     refs, hyps, sample_ids = run_inference(
         model=model,

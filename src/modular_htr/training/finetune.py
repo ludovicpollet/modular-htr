@@ -1,3 +1,4 @@
+import logging
 import math
 from pathlib import Path
 from typing import Any, Callable
@@ -9,6 +10,8 @@ from .utils import log_model_info
 from modular_htr.data.tokenization import CharTokenizer, build_char_tokenizer
 from modular_htr.model.HTRModel import HTRModel
 from modular_htr.types import NewHeadInit, NewSymbolsInit
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -170,8 +173,8 @@ def load_checkpoint(
     if "model_state_dict" not in checkpoint:
         raise KeyError("Missing 'model_state_dict' in checkpoint")
     if "tokenizer" not in checkpoint:
-        print(
-            "Warning: Missing tokenizer in checkpoint, will only infer basic info from config"
+        logger.warning(
+            "Missing tokenizer in checkpoint, will only infer basic info from config"
         )
 
     return checkpoint
@@ -195,8 +198,8 @@ def restore_model_from_checkpoint(
 
     tokenizer = restore_tokenizer_from_checkpoint(checkpoint)
     if tokenizer is None:
-        print(
-            "Warning: Checkpoint is missing a tokenizer. Will infer num_classes from model size."
+        logger.warning(
+            "Checkpoint is missing a tokenizer. Will infer num_classes from model size."
         )
 
     num_classes = len(tokenizer) if tokenizer else model_cfg.get("num_classes")

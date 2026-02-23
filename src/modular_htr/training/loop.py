@@ -1,4 +1,5 @@
 import csv
+import logging
 import math
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
@@ -18,6 +19,8 @@ from modular_htr.types import Augmentation, CTCDecoderMode, DebugMode
 from .ctc import CTCLossWrapper, beam_ctc_decode, build_beam_decoder, greedy_ctc_decode
 from .metrics import cer, wer
 from .utils import CheckpointManager, ScalarMeter, format_metrics, linear_scale
+
+logger = logging.getLogger(__name__)
 
 
 class Trainer:
@@ -203,12 +206,19 @@ class Trainer:
                     )
 
                     if self.cfg.debug is DebugMode.PRINT:
-                        tqdm.write(
-                            f"[dbg] step={step} T={T} B={B} "
-                            f"blank_rate={blank_rate_str} "
-                            f"grad_norm_before_clip={grad_before} "
-                            f"grad_norm_after_clip={grad_after} "
-                            f"pm_delta={dbg['pm_delta']:+.2e}"
+                        logger.debug(
+                            "[dbg] step=%d T=%d B=%d "
+                            "blank_rate=%s "
+                            "grad_norm_before_clip=%s "
+                            "grad_norm_after_clip=%s "
+                            "pm_delta=%+.2e",
+                            step,
+                            T,
+                            B,
+                            blank_rate_str,
+                            grad_before,
+                            grad_after,
+                            dbg["pm_delta"],
                         )
 
                     debug_records.append(
@@ -253,7 +263,7 @@ class Trainer:
         pred = logits.argmax(dim=-1)  # [T,B]
         T, B = pred.shape
         t = torch.arange(T, device=pred.device).unsqueeze(1)  # [T,1]
-        mask = t < input_lengths.unsqueeze(0)  # [T,B]
+        mask = t < input_lengths.to(pred.device).unsqueeze(0)  # [T,B]
         blank = self.tokenizer.blank_index
         return (pred[mask] == blank).float().mean().item()
 
@@ -329,8 +339,11 @@ class Trainer:
                         for i in range(
                             min(self.cfg.checkpoint.print_samples, len(decoded))
                         ):
-                            tqdm.write(
-                                f"[val sample {i}] pred: {decoded[i]!r} | gt: {batch.texts[i]!r}"
+                            logger.info(
+                                "[val sample %d] pred: %r | gt: %r",
+                                i,
+                                decoded[i],
+                                batch.texts[i],
                             )
 
         out = {"loss": loss_meter.mean_float()}
@@ -366,7 +379,7 @@ class Trainer:
                 and epoch % self.cfg.checkpoint.full_eval_interval == 0
             )
             val_metrics = self.evaluate(val_loader, compute_error_rates)
-            tqdm.write(
+            logger.info(
                 format_metrics(epoch, train_metrics, val_metrics, self.optimizer)
             )
 

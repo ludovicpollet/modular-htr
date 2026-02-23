@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -5,6 +6,8 @@ from pathlib import Path
 import datasets
 
 from modular_htr.lm.utils import prepare_kenlm_training_text
+
+logger = logging.getLogger(__name__)
 
 
 def find_kenlm_binary(name: str) -> Path:
@@ -60,15 +63,15 @@ def build_kenlm(
         intermediate_dir.mkdir(parents=True, exist_ok=True)
         lmplz_cmd.extend(["--intermediate", str(intermediate_dir)])
 
-    print(f"Running lmplz (order={order}) ...")
+    logger.info("Running lmplz (order=%d) ...", order)
     subprocess.run([str(c) for c in lmplz_cmd], check=True)
 
-    print("Running build_binary ...")
+    logger.info("Running build_binary ...")
     subprocess.run(
         [str(build_binary), str(arpa_path), str(output_path)],
         check=True,
     )
-    print(f"Built LM: {output_path}")
+    logger.info("Built LM: %s", output_path)
     return output_path
 
 
@@ -102,15 +105,15 @@ def interpolate_kenlm(
         interp_cmd.extend(["-m", str(d), "-w", str(w)])
     interp_cmd.extend(["-o", str(arpa_path)])
 
-    print(f"Interpolating {len(model_dirs)} models ...")
+    logger.info("Interpolating %d models ...", len(model_dirs))
     subprocess.run(interp_cmd, check=True)
 
-    print("Running build_binary ...")
+    logger.info("Running build_binary ...")
     subprocess.run(
         [str(build_binary), str(arpa_path), str(output_path)],
         check=True,
     )
-    print(f"Built interpolated LM: {output_path}")
+    logger.info("Built interpolated LM: %s", output_path)
     return output_path
 
 
@@ -164,7 +167,7 @@ def run_build_lm(cfg) -> None:
     else:
         raise ValueError(f"Unknown LM source type: {type(cfg.source)}")
 
-    print(f"Collected {len(texts)} text samples.")
+    logger.info("Collected %d text samples.", len(texts))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         training_text_path = Path(tmpdir) / "training_text.txt"

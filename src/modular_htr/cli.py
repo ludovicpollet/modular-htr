@@ -1,3 +1,4 @@
+import logging
 import math
 from dataclasses import asdict
 
@@ -10,6 +11,7 @@ from modular_htr.data.analysis import run_analysis
 from modular_htr.data.dataloaders import make_dataloaders
 from modular_htr.data.hf_dataset import build_hf_dataset
 from modular_htr.data.tokenization import apply_ctc_tokenizer, build_char_tokenizer
+from modular_htr.logging_config import add_file_handler, setup_logging
 from modular_htr.model.HTRModel import HTRModel
 from modular_htr.training.ctc import CTCLossWrapper
 from modular_htr.training.evaluate import run_evaluate
@@ -30,6 +32,8 @@ from modular_htr.training.utils import (
     set_all_seeds,
 )
 from modular_htr.types import MonitorMetric
+
+logger = logging.getLogger(__name__)
 
 type Scheduler = (
     torch.optim.lr_scheduler.OneCycleLR | torch.optim.lr_scheduler.CosineAnnealingLR
@@ -120,8 +124,11 @@ def run_training(cfg: modular_htr.config.Train) -> None:
         cfg.data.strip_space_before_punctuation,
     )
 
-    print(f"Built the tokenizer with {len(tokenizer)} chars:")
-    print(tokenizer.to_dict()["alphabet"])
+    logger.info(
+        "Built the tokenizer with %d chars: %s",
+        len(tokenizer),
+        tokenizer.to_dict()["alphabet"],
+    )
 
     train_loader, val_loader = make_dataloaders(
         ds,  # type: ignore (should be duck-type compatible)
@@ -165,6 +172,7 @@ def run_training(cfg: modular_htr.config.Train) -> None:
     step_per_batch = cfg.scheduler.step_per_batch
 
     run_dir = create_run_dir(cfg.base_dir, cfg.run_name)
+    add_file_handler(run_dir / "train.log")
     with open(f"{run_dir}/model_summary.txt", "w") as f:
         f.write(str(model_summary))
     dump_config(run_dir, cfg)
@@ -255,6 +263,7 @@ def run_finetune(cfg: modular_htr.config.Finetune) -> None:
     step_per_batch = cfg.scheduler.step_per_batch
 
     run_dir = create_run_dir(cfg.base_dir, cfg.run_name)
+    add_file_handler(run_dir / "train.log")
     dump_config(run_dir, cfg)
 
     checkpoint_manager = CheckpointManager(
@@ -297,6 +306,7 @@ def run_ds_compile(cfg: modular_htr.config.CompileDataset):
 
 
 def main():
+    setup_logging()
     cfg = tyro.cli(
         modular_htr.config.Config,  # type: ignore (tyro doesn't get the type alias)
         config=(
@@ -325,7 +335,7 @@ def main():
 
         run_interpolate_lm(cfg)
     else:
-        print("Don't know what to do.")
+        raise NotImplementedError
 
 
 if __name__ == "__main__":
