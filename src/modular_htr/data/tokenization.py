@@ -1,6 +1,7 @@
 import re
 import unicodedata
 import collections
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,7 +81,7 @@ class CharTokenizer:
         if not (0 <= pad_index <= len(alphabet)):
             raise ValueError("Invalid pad index")
         if not blank_index == 0:
-            print("Warning: blank index needs to be 0 for CTC decoding")
+            warnings.warn("blank index needs to be 0 for CTC decoding", stacklevel=2)
 
         unicode_form = (
             UnicodeForm(unicode_form_str) if unicode_form_str is not None else None

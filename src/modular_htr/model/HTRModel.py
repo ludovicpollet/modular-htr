@@ -1,4 +1,5 @@
 import enum
+import logging
 from abc import ABC, abstractmethod
 from typing import Literal, Self
 
@@ -10,6 +11,8 @@ from modular_htr.types import HeightCollapseMode, NormType, SequenceEncoderType
 
 from .ConvNeXt import ConvNeXtBackbone, load_pretrained_timm_weights
 from .MHA import RelBiasTransformerStack
+
+logger = logging.getLogger(__name__)
 
 
 def get_norm(norm_type: NormType | str, num_channels: int) -> nn.Module:
@@ -842,8 +845,10 @@ class HTRModel(nn.Module):
             and fixed_height != saved_height
         ):
             config["fixed_height"] = fixed_height
-            print(
-                f"[WARNING] Model was trained with fixed height {saved_height}; rebuilding with {fixed_height}."
+            logger.warning(
+                "Model was trained with fixed height %s; rebuilding with %s.",
+                saved_height,
+                fixed_height,
             )
         if fixed_height is not None:
             config["fixed_height"] = fixed_height

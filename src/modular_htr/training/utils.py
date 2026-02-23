@@ -1,13 +1,13 @@
 import datetime
 import json
+import logging
 import pathlib
 import random
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
 from datasets import (
     Dataset,
     DatasetDict,
@@ -19,6 +19,8 @@ from datasets import (
 from modular_htr import types
 from modular_htr import config
 from modular_htr.data.tokenization import CharTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 def get_device() -> torch.device:
@@ -152,13 +154,12 @@ def _normalize_columns(
 def _get_multi_dataset(cfg: config.MultiDataset) -> DatasetDict:
     """Load and concatenate multiple HF Hub datasets into a single DatasetDict."""
     sources = _parse_sources(cfg.sources_file)
-    log = tqdm.write
 
     train_parts: list[Dataset] = []
     val_parts: list[Dataset] = []
 
     for src in sources:
-        log(f"Loading {src.name} ...")
+        logger.info("Loading %s ...", src.name)
         ds = cast(DatasetDict, load_dataset(src.name, streaming=False))
         if isinstance(ds, Dataset):
             ds = DatasetDict({"train": ds})
@@ -176,14 +177,14 @@ def _get_multi_dataset(cfg: config.MultiDataset) -> DatasetDict:
                 ds[src.train_split], src.img_col, src.text_col, src.name
             )
             train_parts.append(part)
-            log(f"  train: {len(part)} samples")
+            logger.info("  train: %d samples", len(part))
 
         if val_split_name is not None:
             part = _normalize_columns(
                 ds[val_split_name], src.img_col, src.text_col, src.name
             )
             val_parts.append(part)
-            log(f"  val ({val_split_name}): {len(part)} samples")
+            logger.info("  val (%s): %d samples", val_split_name, len(part))
 
     if not train_parts:
         raise ValueError(
@@ -191,13 +192,19 @@ def _get_multi_dataset(cfg: config.MultiDataset) -> DatasetDict:
         )
 
     result: dict[str, Dataset] = {"train": concatenate_datasets(train_parts)}
-    log(
-        f"Combined train: {len(result['train'])} samples from {len(train_parts)} sources"
+    logger.info(
+        "Combined train: %d samples from %d sources",
+        len(result["train"]),
+        len(train_parts),
     )
 
     if val_parts:
         result["val"] = concatenate_datasets(val_parts)
-        log(f"Combined val: {len(result['val'])} samples from {len(val_parts)} sources")
+        logger.info(
+            "Combined val: %d samples from %d sources",
+            len(result["val"]),
+            len(val_parts),
+        )
 
     return DatasetDict(result)  # type: ignore[call-overload]
 
@@ -211,10 +218,6 @@ def get_dataset(cfg: config.Dataset) -> DatasetDict:
         return normalize_splits(get_single_dataset(cfg))
 
     raise ValueError(f"Unknown dataset config type: {type(cfg)}")
-
-
-def make_log_fn(use_pbar: bool = True) -> Callable[[str], None]:
-    return tqdm.write if use_pbar else print
 
 
 def format_metrics(epoch, train_metrics, val_metrics, optimizer):
@@ -389,8 +392,9 @@ class CheckpointManager:
 def log_model_info(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    msg = (
-        f"{model.__class__.__name__}: "
-        f"trainable={trainable / 1e6:.2f}M / total={total / 1e6:.2f}M"
+    logger.info(
+        "%s: trainable=%.2fM / total=%.2fM",
+        model.__class__.__name__,
+        trainable / 1e6,
+        total / 1e6,
     )
-    tqdm.write(msg)

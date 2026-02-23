@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import random
@@ -12,6 +13,8 @@ from modular_htr.types import Augmentation
 
 from .tokenization import CharTokenizer
 from .transforms import make_preprocessing_fn, make_runtime_transform
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -170,11 +173,11 @@ def _apply_size_filter(
         desc=f"Filtering large images for memory efficiency ({split_name})",
     )
     diff = original_len - len(ds)
-    print(f"[{split_name}] Size filter: {original_len} → {len(ds)}")
+    logger.info("[%s] Size filter: %d -> %d", split_name, original_len, len(ds))
     if diff > 0:
-        print(f"(Removed {diff}, threshold={max_width:.0f}px)")
+        logger.info("Removed %d, threshold=%.0fpx", diff, max_width)
     else:
-        print("Nothing to remove.")
+        logger.info("Nothing to remove.")
 
     return ds
 
@@ -204,12 +207,14 @@ def _apply_ctc_filter(
     ds = ds.filter(meets_ctc_requirement, desc=f"CTC filter ({split_name})")
 
     diff = original_len - len(ds)
-    print(f"[{split_name}] CTC filter: {original_len} → {len(ds)}")
-    print(f"stride={config.time_reduction_factor}, margin={config.ctc_margin}")
+    logger.info("[%s] CTC filter: %d -> %d", split_name, original_len, len(ds))
+    logger.info(
+        "stride=%d, margin=%.2f", config.time_reduction_factor, config.ctc_margin
+    )
     if diff > 0:
-        print(f"(removed {diff})")
+        logger.info("Removed %d", diff)
     else:
-        print("Nothing to remove.")
+        logger.info("Nothing to remove.")
     return ds
 
 
