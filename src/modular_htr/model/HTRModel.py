@@ -157,7 +157,7 @@ class SEBlock(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(channels, reduced, bias=False),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(reduced, channels, bias=False),
             nn.Sigmoid(),
         )
@@ -229,7 +229,7 @@ class CNNBackbone(nn.Module):
                     bias=False,
                 ),
                 get_norm(norm_type, stem_channels),
-                nn.ReLU(inplace=True),
+                nn.GELU(),
             )
             in_ch = stem_channels
 

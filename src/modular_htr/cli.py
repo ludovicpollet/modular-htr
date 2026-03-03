@@ -11,7 +11,7 @@ from modular_htr.data.analysis import run_analysis
 from modular_htr.data.dataloaders import make_dataloaders
 from modular_htr.data.hf_dataset import build_hf_dataset
 from modular_htr.data.tokenization import apply_ctc_tokenizer, build_char_tokenizer
-from modular_htr.logging_config import add_file_handler, setup_logging
+from modular_htr.logging_config import add_file_handler, log_memory_usage, setup_logging
 from modular_htr.model.HTRModel import HTRModel
 from modular_htr.training.ctc import CTCLossWrapper
 from modular_htr.training.evaluate import run_evaluate
@@ -173,6 +173,7 @@ def run_training(cfg: modular_htr.config.Train) -> None:
 
     run_dir = create_run_dir(cfg.base_dir, cfg.run_name)
     add_file_handler(run_dir / "train.log")
+    log_memory_usage(logger, "After dataset loading")
     with open(f"{run_dir}/model_summary.txt", "w") as f:
         f.write(str(model_summary))
     dump_config(run_dir, cfg)
@@ -264,6 +265,7 @@ def run_finetune(cfg: modular_htr.config.Finetune) -> None:
 
     run_dir = create_run_dir(cfg.base_dir, cfg.run_name)
     add_file_handler(run_dir / "train.log")
+    log_memory_usage(logger, "After dataset loading")
     dump_config(run_dir, cfg)
 
     checkpoint_manager = CheckpointManager(

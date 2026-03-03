@@ -318,15 +318,19 @@ def make_dataloaders(
         }
     )
 
-    persistent_workers = num_workers > 0
-
+    # persistent_workers=False so train workers are shut down before val workers
+    # spawn, avoiding doubling the active worker count at the epoch transition.
+    # forkserver keeps the per-epoch restart cheap (workers fork from a lean
+    # server process, not the parent).
     loader_kwargs = dict(
         collate_fn=ctc_collate,
         num_workers=num_workers,
-        persistent_workers=persistent_workers,
+        persistent_workers=False,
         pin_memory=pin_memory,
     )
-    if persistent_workers and prefetch_factor is not None:
+    if num_workers > 0:
+        loader_kwargs["multiprocessing_context"] = "forkserver"
+    if num_workers > 0 and prefetch_factor is not None:
         loader_kwargs["prefetch_factor"] = prefetch_factor
 
     if use_bucketing:
@@ -348,10 +352,14 @@ def make_dataloaders(
             **loader_kwargs,  # type: ignore
         )
 
+    # Val workers only run once per epoch, so persistent_workers is unnecessary.
+    # Disabling it avoids doubling the active worker count (train + val) at the
+    # train-to-eval transition, which can OOM-kill the process on large datasets.
+    val_loader_kwargs = {**loader_kwargs, "persistent_workers": False}
     val_loader = torch.utils.data.DataLoader(
         ds["val"],  # type: ignore[arg-type]
         batch_size=batch_size,
         shuffle=False,
-        **loader_kwargs,  # type: ignore
+        **val_loader_kwargs,  # type: ignore
     )
     return train_loader, val_loader

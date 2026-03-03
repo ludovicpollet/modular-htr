@@ -305,13 +305,13 @@ class RetsinasBackboneConfig(CNNBackboneConfig):
 
 @dataclass
 class ConvNeXtBackboneConfig:
-    """ConvNeXt backbone (Liu et al. 2022), modified for HTR."""
+    """ConvNeXt backbone (Liu et al. 2022), modified for HTR. Smaller sizes, block counts and modified downsampling."""
 
     backbone_type: tyro.conf.Fixed[str] = "convnext"
     # Output channels for each stage.
     channels: list[int] = field(default_factory=lambda: [64, 128, 256])
     # Number of ConvNeXt blocks per stage.
-    blocks_per_stage: list[int] = field(default_factory=lambda: [2, 4, 2])
+    blocks_per_stage: list[int] = field(default_factory=lambda: [2, 4, 3])
     # Downsample kernels between stages (length = len(channels) - 1).
     downsample_kernels: list[tuple[int, int]] = field(
         default_factory=lambda: [(2, 2), (2, 2)]
@@ -330,15 +330,7 @@ class ConvNeXtBackboneConfig:
 
 @dataclass
 class ConvNeXtTinyPretrainedConfig(ConvNeXtBackboneConfig):
-    """ConvNeXt-Tiny with pretrained weights from timm.
-
-    Uses symmetric stem stride (4,4) for direct weight transfer from ImageNet
-    pretraining, with asymmetric downsamples to keep width reduction at 8x.
-
-    Spatial reduction:
-        Height: 4 (stem) x 2 x 2 x 2 = 32x
-        Width:  4 (stem) x 2 x 1 x 1 = 8x
-    """
+    """ConvNeXt-Tiny with pretrained weights from timm. Only downsampling is modified."""
 
     # timm model name to load pretrained weights from.
     pretrained: str = "convnext_tiny.fb_in22k_ft_in1k"
