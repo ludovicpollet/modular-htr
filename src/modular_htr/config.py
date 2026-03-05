@@ -108,6 +108,9 @@ class Data:
     augmentation: types.Augmentation = types.Augmentation.GPU
     # Whether to invert the image (so that strokes are bright and background is dark).
     invert_image: bool = True
+    # Fixed width for all batched images. If set, images wider than this are scaled
+    # down to fit, and all batches are padded to this width. None = variable-width mode.
+    fixed_width: int | None = None
     # Configuration options for the width filters
     width_filters: WidthFilters = field(default_factory=WidthFilters)
 
@@ -130,6 +133,9 @@ class EvalData:
     augmentation: types.Augmentation = types.Augmentation.GPU
     # Whether to invert the image (so that strokes are bright and background is dark).
     invert_image: bool = True
+    # Fixed width for all batched images. If set, images wider than this are scaled
+    # down to fit, and all batches are padded to this width. None = variable-width mode.
+    fixed_width: int | None = None
     # Configuration options for the width filters
     width_filters: WidthFilters = field(default_factory=WidthFilters)
 

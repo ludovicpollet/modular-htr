@@ -325,9 +325,12 @@ class CheckpointManager:
         scaler,
         val_metrics,
     ) -> dict[str, Any]:
+        # Strip torch.compile "_orig_mod." prefix so checkpoints are portable
+        raw_sd = model.state_dict()
+        clean_sd = {k.replace("._orig_mod.", "."): v for k, v in raw_sd.items()}
         state = {
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": clean_sd,
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
             "scaler_state_dict": scaler.state_dict() if scaler else None,

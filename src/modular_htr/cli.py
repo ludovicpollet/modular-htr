@@ -140,10 +140,11 @@ def run_training(cfg: modular_htr.config.Train) -> None:
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         use_bucketing=cfg.data.use_bucketing,
-        bin_bucket_widths=True,
+        bin_bucket_widths=False,
         pin_memory=device.type != "cpu",
         augmentation=cfg.data.augmentation,
         invert_image=cfg.data.invert_image,
+        fixed_width=cfg.data.fixed_width,
     )
 
     model = build_model(cfg.model, num_classes=len(tokenizer))
@@ -158,8 +159,14 @@ def run_training(cfg: modular_htr.config.Train) -> None:
     if cfg.trainer.channels_last:
         model = model.to(memory_format=torch.channels_last)  # type: ignore
 
-    # compile is unpractical due to the variable width batches, even with dynamic=True
-    # model.backbone = torch.compile(model.backbone, dynamic=True)
+    # torch.compile is auto-enabled for the backbone in fixed-width mode (see below).
+    if cfg.data.fixed_width is not None:
+        model.backbone = torch.compile(model.backbone)  # type: ignore[assignment]
+        logger.info("Fixed-width mode: compiled backbone with torch.compile.")
+        if cfg.trainer.torch_benchmark:
+            logger.warning(
+                "cudNN benchmark can cause issues with torch.compile. Disable if training slows down a regular intervals."
+            )
 
     epochs = cfg.trainer.epochs
     loss_fn = CTCLossWrapper(blank=tokenizer.blank_index)
@@ -226,6 +233,14 @@ def run_finetune(cfg: modular_htr.config.Finetune) -> None:
     if cfg.trainer.channels_last:
         model = model.to(memory_format=torch.channels_last)  # type: ignore
 
+    if cfg.data.fixed_width is not None:
+        model.backbone = torch.compile(model.backbone)  # type: ignore[assignment]
+        logger.info("Fixed-width mode: compiled backbone with torch.compile.")
+        if cfg.trainer.torch_benchmark:
+            logger.warning(
+                "cudNN benchmark can cause issues with torch.compile. Disable if training slows down a regular intervals."
+            )
+
     tokenizer = merged_tokenizer
     # Allow CLI override of strip_space_before_punctuation (default: inherit from checkpoint).
     if cfg.data.strip_space_before_punctuation:
@@ -251,6 +266,7 @@ def run_finetune(cfg: modular_htr.config.Finetune) -> None:
         use_bucketing=cfg.data.use_bucketing,
         pin_memory=device.type != "cpu",
         invert_image=cfg.data.invert_image,
+        fixed_width=cfg.data.fixed_width,
     )
 
     epochs = cfg.trainer.epochs

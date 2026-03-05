@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import statistics
@@ -105,6 +106,8 @@ def prepare_eval(
     split_size = len(split_ds)
     logger.info("Evaluating on split '%s': %d samples", cfg.split, len(split_ds))
 
+    fixed_width = cfg.data.fixed_width
+
     split_ds = _preprocess_split(
         split_ds,
         fixed_height=fixed_height,
@@ -114,16 +117,22 @@ def prepare_eval(
         filter_config=_resolve_filter_config(cfg),
         split_name=cfg.split,
         num_proc=cfg.data.num_workers or 1,
+        fixed_width=fixed_width,
     )
 
     transform = make_runtime_transform(augment=False, invert=cfg.data.invert_image)
     split_ds = split_ds.with_transform(transform)
 
+    collate_fn = (
+        functools.partial(ctc_collate, fixed_width=fixed_width)
+        if fixed_width is not None
+        else ctc_collate
+    )
     loader = torch.utils.data.DataLoader(
         split_ds,  # type: ignore[arg-type]
         batch_size=cfg.data.batch_size,
         shuffle=False,
-        collate_fn=ctc_collate,
+        collate_fn=collate_fn,
         num_workers=cfg.data.num_workers,
         pin_memory=device.type != "cpu",
     )

@@ -116,6 +116,25 @@ class TestCtcCollate:
         assert batch.targets.tolist() == [3, 4, 5, 6, 1, 2]
         assert batch.target_lengths.tolist() == [3, 1, 2]
 
+    def test_fixed_width_padding_preserves_content_widths(self):
+        examples = [
+            _make_collate_example(width=30, labels=[1, 2]),
+            _make_collate_example(width=50, labels=[3, 4, 5]),
+            _make_collate_example(width=40, labels=[6]),
+        ]
+        batch = ctc_collate(examples, fixed_width=100)
+
+        # Padded to fixed_width, not to max content width (50).
+        assert batch.images.shape == (3, 1, 32, 100)
+
+        # Content widths preserved (sorted descending), not the padded width.
+        assert batch.widths.tolist() == [50, 40, 30]
+
+        # Padding region beyond content width is zeros.
+        assert (batch.images[0, :, :, 50:] == 0).all()
+        assert (batch.images[1, :, :, 40:] == 0).all()
+        assert (batch.images[2, :, :, 30:] == 0).all()
+
     def test_empty_batch_raises(self):
         with pytest.raises(ValueError, match="Empty batch"):
             ctc_collate([])

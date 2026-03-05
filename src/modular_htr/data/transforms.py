@@ -51,11 +51,24 @@ def resize_keep_aspect(pil_img: PIL.Image.Image, fixed_height: int) -> PIL.Image
     return pil_img.resize((new_w, new_h), resample=PIL.Image.Resampling.HAMMING)
 
 
+def resize_to_fit(
+    pil_img: PIL.Image.Image,
+    fixed_height: int,
+    max_width: int,
+) -> PIL.Image.Image:
+    """Resize to fixed height preserving aspect ratio, then scale down if wider than max_width."""
+    img = resize_keep_aspect(pil_img, fixed_height)
+    if img.size[0] > max_width:
+        img = img.resize((max_width, fixed_height), resample=PIL.Image.Resampling.HAMMING)
+    return img
+
+
 def make_preprocessing_fn(
     fixed_height: int,
     tokenizer: CharTokenizer,
     text_col: str = "text",
     image_col: str = "image",
+    fixed_width: int | None = None,
 ) -> Callable:
     """
     One-time preprocessing pipeline to avoid repeated maps. Cached by HuggingFace datasets.
@@ -71,7 +84,10 @@ def make_preprocessing_fn(
         if img.mode != "L":
             img = img.convert("L")
         # resize
-        img = resize_keep_aspect(img, fixed_height)
+        if fixed_width is not None:
+            img = resize_to_fit(img, fixed_height, fixed_width)
+        else:
+            img = resize_keep_aspect(img, fixed_height)
 
         # normalize text to match the tokenizer's alphabet, then tokenize
         text = normalize_text(

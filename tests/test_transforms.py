@@ -1,8 +1,26 @@
 import unicodedata
 
 import PIL.Image
+import pytest
 
-from modular_htr.data.transforms import make_preprocessing_fn
+from modular_htr.data.transforms import make_preprocessing_fn, resize_to_fit
+
+
+@pytest.mark.parametrize(
+    "input_w, max_w, expected_w",
+    [
+        (100, 200, 100),  # narrow image: untouched
+        (400, 200, 200),  # wide image: scaled down
+        (200, 200, 200),  # at limit: untouched
+    ],
+    ids=["narrow", "wide", "at-limit"],
+)
+def test_resize_to_fit(input_w, max_w, expected_w):
+    """resize_to_fit scales down images wider than max_width, leaves others untouched."""
+    fixed_height = 64
+    img = PIL.Image.new("L", (input_w, fixed_height))
+    result = resize_to_fit(img, fixed_height, max_w)
+    assert result.size == (expected_w, fixed_height)
 
 
 def test_preprocessing_normalizes_whitespace():

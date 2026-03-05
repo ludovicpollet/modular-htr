@@ -28,7 +28,7 @@ class DropPath(nn.Module):
         keep = 1.0 - self.drop_prob
         # Shape [B, 1, 1, 1, ...] to broadcast over all spatial dims
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask = torch.rand(shape, dtype=x.dtype, device=x.device).add_(keep).floor_()
+        mask = (torch.rand(shape, dtype=x.dtype, device=x.device) + keep).floor()
         return x * mask / keep
 
 

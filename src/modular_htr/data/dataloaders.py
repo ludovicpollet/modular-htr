@@ -1,3 +1,4 @@
+import functools
 import logging
 import math
 import os
@@ -37,7 +38,7 @@ class Batch:
         )
 
 
-def ctc_collate(batch) -> Batch:
+def ctc_collate(batch, fixed_width: int | None = None) -> Batch:
     if not batch:
         raise ValueError("Empty batch passed to collate")
 
@@ -50,6 +51,8 @@ def ctc_collate(batch) -> Batch:
     B = len(batch)
     C, H = images[0].shape[0], images[0].shape[1]
     max_W = max(img.shape[-1] for img in images)
+    if fixed_width is not None:
+        max_W = max(max_W, fixed_width)
 
     images_padded = images[0].new_zeros((B, C, H, max_W))
     for i, img in enumerate(images):
@@ -227,6 +230,7 @@ def _preprocess_split(
     filter_config: WidthFilters,
     split_name: str,
     num_proc: int,
+    fixed_width: int | None = None,
 ) -> datasets.Dataset:
     """
     Single preprocessing pass then apply filters
@@ -238,6 +242,7 @@ def _preprocess_split(
         tokenizer=tokenizer,
         text_col=text_col,
         image_col=image_col,
+        fixed_width=fixed_width,
     )
 
     ds = ds.map(
@@ -268,6 +273,7 @@ def make_dataloaders(
     prefetch_factor: int = 2,
     augmentation: Augmentation = Augmentation.NONE,
     invert_image: bool = False,
+    fixed_width: int | None = None,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """High level convenience to build DataLoaders from a HF DatasetDict"""
     if not isinstance(ds, datasets.DatasetDict):
@@ -288,6 +294,7 @@ def make_dataloaders(
                 filter_config,
                 "train",
                 num_proc=num_workers,
+                fixed_width=fixed_width,
             ),
             "val": _preprocess_split(
                 ds["val"],
@@ -298,12 +305,18 @@ def make_dataloaders(
                 filter_config,
                 "val",
                 num_proc=num_workers,
+                fixed_width=fixed_width,
             ),
         }
     )
 
-    bucket_bin = 256 if (torch.backends.cudnn.benchmark or bin_bucket_widths) else None
-    widths_train = _bucket_widths(ds["train"]["width"], bin_size=bucket_bin)
+    effective_bucketing = use_bucketing and fixed_width is None
+    if use_bucketing and fixed_width is not None:
+        logger.info("Fixed-width mode: bucketing disabled.")
+
+    if effective_bucketing:
+        bucket_bin = 256 if (torch.backends.cudnn.benchmark or bin_bucket_widths) else None
+        widths_train = _bucket_widths(ds["train"]["width"], bin_size=bucket_bin)
 
     train_transform = make_runtime_transform(
         augment=augmentation is Augmentation.CPU,
@@ -318,12 +331,18 @@ def make_dataloaders(
         }
     )
 
+    collate_fn = (
+        functools.partial(ctc_collate, fixed_width=fixed_width)
+        if fixed_width is not None
+        else ctc_collate
+    )
+
     # persistent_workers=False so train workers are shut down before val workers
     # spawn, avoiding doubling the active worker count at the epoch transition.
     # forkserver keeps the per-epoch restart cheap (workers fork from a lean
     # server process, not the parent).
     loader_kwargs = dict(
-        collate_fn=ctc_collate,
+        collate_fn=collate_fn,
         num_workers=num_workers,
         persistent_workers=False,
         pin_memory=pin_memory,
@@ -333,7 +352,7 @@ def make_dataloaders(
     if num_workers > 0 and prefetch_factor is not None:
         loader_kwargs["prefetch_factor"] = prefetch_factor
 
-    if use_bucketing:
+    if effective_bucketing:
         train_batch_sampler = BucketByWidthSampler(
             widths=widths_train,
             batch_size=batch_size,
@@ -349,6 +368,7 @@ def make_dataloaders(
             ds["train"],  # type: ignore[arg-type]
             batch_size=batch_size,
             shuffle=True,
+            drop_last=True,
             **loader_kwargs,  # type: ignore
         )
 
