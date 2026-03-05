@@ -53,7 +53,16 @@ def setup_logging(level: int = logging.INFO, quiet_dependencies=True) -> None:
 
     # Quiet down chatty libraries.
     if quiet_dependencies:
-        for name in ("datasets", "PIL", "torch", "fsspec", "urllib3"):
+        for name in (
+            "datasets",
+            "PIL",
+            "torch",
+            "fsspec",
+            "urllib3",
+            "httpx",
+            "httpcore",
+            "filelock",
+        ):
             logging.getLogger(name).setLevel(logging.WARNING)
 
 
@@ -84,14 +93,14 @@ def add_file_handler(path: str | Path) -> logging.Handler:
 
 
 def log_memory_usage(logger: logging.Logger, label: str) -> None:
-    """Log current and peak RSS to *logger* at INFO level.
+    """Log current and peak RSS plus system-available memory at DEBUG level.
 
     Current RSS is read from ``/proc/self/status`` (Linux only).
     Peak RSS comes from :func:`resource.getrusage` (POSIX, reported by the
-    kernel in kilobytes on Linux).
+    kernel in kilobytes on Linux).  System-available memory is read from
+    ``/proc/meminfo`` (``MemAvailable``).
 
-    Silently does nothing on platforms where ``/proc/self/status`` is
-    unavailable.
+    Silently does nothing on platforms where that information is not available.
     """
     try:
         with open("/proc/self/status") as f:
@@ -105,9 +114,22 @@ def log_memory_usage(logger: logging.Logger, label: str) -> None:
         return
 
     peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # kilobytes on Linux
-    logger.info(
-        "[memory] %s — RSS: %.1f GB, peak RSS: %.1f GB",
+
+    available_gb = ""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail_kb = int(line.split()[1])
+                    available_gb = f", system available: {avail_kb / 1_048_576:.1f} GB"
+                    break
+    except (FileNotFoundError, OSError):
+        pass
+
+    logger.debug(
+        "[memory] %s — RSS: %.1f GB, peak RSS: %.1f GB%s",
         label,
         current_kb / 1_048_576,
         peak_kb / 1_048_576,
+        available_gb,
     )
