@@ -84,14 +84,15 @@ def get_single_dataset(
     cfg: config.LocalDataset | config.HubDataset,
 ) -> DatasetDict:
     """Load a single local or hub dataset without split normalization."""
-    if isinstance(cfg, config.LocalDataset):
-        ds = load_from_disk(cfg.path)
-    elif isinstance(cfg, config.HubDataset):
-        # casting to avoid the iterable return types variant
-        # to do later, maybe support streaming
-        ds = cast(DatasetDict, load_dataset(cfg.name, streaming=False))
-    else:
-        raise ValueError(f"Unknown dataset config type: {type(cfg)}")
+    match cfg:
+        case config.LocalDataset() as local:
+            ds = load_from_disk(local.path)
+        case config.HubDataset() as hub:
+            # casting to avoid the iterable return types variant
+            # to do later, maybe support streaming
+            ds = cast(DatasetDict, load_dataset(hub.name, streaming=False))
+        case _:
+            raise ValueError(f"Unknown dataset config type: {type(cfg)}")
 
     if isinstance(ds, Dataset):
         # Bare dataset without splits — treat as train-only.

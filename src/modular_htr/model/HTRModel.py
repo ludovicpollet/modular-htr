@@ -17,15 +17,16 @@ logger = logging.getLogger(__name__)
 
 def get_norm(norm_type: NormType | str, num_channels: int) -> nn.Module:
     """Create normalization layer."""
-    norm_type = NormType(norm_type)
-    if norm_type == NormType.BATCH:
-        return nn.BatchNorm2d(num_channels)
-    elif norm_type == NormType.GROUP:
-        num_groups = min(8, num_channels)
-        while num_groups > 1 and (num_channels % num_groups) != 0:
-            num_groups -= 1
-        return nn.GroupNorm(num_groups, num_channels)
-    raise ValueError(f"Unknown norm_type '{norm_type}'")
+    match NormType(norm_type):
+        case NormType.BATCH:
+            return nn.BatchNorm2d(num_channels)
+        case NormType.GROUP:
+            num_groups = min(8, num_channels)
+            while num_groups > 1 and (num_channels % num_groups) != 0:
+                num_groups -= 1
+            return nn.GroupNorm(num_groups, num_channels)
+        case _ as unknown:
+            raise ValueError(f"Unknown norm_type '{unknown}'")
 
 
 class ConvBlock(nn.Module):
@@ -401,16 +402,17 @@ def create_height_collapse(
     dropout: float = 0.0,
 ) -> HeightCollapse:
     """Factory for height collapse strategies."""
-    collapse_type = HeightCollapseMode(collapse_type)
-    if collapse_type == HeightCollapseMode.CONV:
-        return ConvHeightCollapse(channels, height)
-    elif collapse_type == HeightCollapseMode.ATTENTION:
-        return AttentionHeightCollapse(channels, dropout=dropout)
-    elif collapse_type == HeightCollapseMode.MEAN:
-        return PoolHeightCollapse("mean")
-    elif collapse_type == HeightCollapseMode.MAX:
-        return PoolHeightCollapse("max")
-    raise ValueError(f"Unknown collapse type: {collapse_type}")
+    match HeightCollapseMode(collapse_type):
+        case HeightCollapseMode.CONV:
+            return ConvHeightCollapse(channels, height)
+        case HeightCollapseMode.ATTENTION:
+            return AttentionHeightCollapse(channels, dropout=dropout)
+        case HeightCollapseMode.MEAN:
+            return PoolHeightCollapse("mean")
+        case HeightCollapseMode.MAX:
+            return PoolHeightCollapse("max")
+        case _ as unknown:
+            raise ValueError(f"Unknown collapse type: {unknown}")
 
 
 class TemporalConvBlock(nn.Module):
@@ -597,19 +599,19 @@ def create_sequence_encoder(
     **kwargs,
 ) -> SequenceEncoder:
     """Factory for sequence encoders."""
-    # coerce to enum type
-    type = SequenceEncoderType(type)
-    if type == SequenceEncoderType.LSTM:
-        return LSTMEncoder(input_size, hidden_size, num_layers, dropout)
-    elif type == SequenceEncoderType.TRANSFORMER:
-        return RelBiasTransformerEncoder(
-            input_size,
-            hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            **kwargs,
-        )
-    raise ValueError(f"Unknown sequence encoder type: {type}")
+    match SequenceEncoderType(type):
+        case SequenceEncoderType.LSTM:
+            return LSTMEncoder(input_size, hidden_size, num_layers, dropout)
+        case SequenceEncoderType.TRANSFORMER:
+            return RelBiasTransformerEncoder(
+                input_size,
+                hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                **kwargs,
+            )
+        case _ as unknown:
+            raise ValueError(f"Unknown sequence encoder type: {unknown}")
 
 
 def create_backbone(

@@ -84,28 +84,28 @@ def build_scheduler(
     epochs: int,
     steps_per_epoch: int | None,
 ) -> Scheduler:
-    if isinstance(cfg, modular_htr.config.Cosine):
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer=optimizer, T_max=epochs, eta_min=cfg.eta_min
-        )
-        return scheduler
-    if isinstance(cfg, modular_htr.config.Onecycle):
-        if steps_per_epoch is None:
-            raise ValueError(
-                "Can't build a OneCycleLR without computing steps_per_epoch."
+    match cfg:
+        case modular_htr.config.Cosine() as cosine:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer=optimizer, T_max=epochs, eta_min=cosine.eta_min
             )
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer=optimizer,
-            max_lr=lr,
-            epochs=epochs,
-            steps_per_epoch=steps_per_epoch,
-            pct_start=cfg.pct_start,
-            anneal_strategy=cfg.anneal_strategy.value,
-            div_factor=cfg.div_factor,
-            final_div_factor=cfg.final_div_factor,
-        )
-        return scheduler
-    raise NotImplementedError("Unknown scheduler config")
+        case modular_htr.config.Onecycle() as onecycle:
+            if steps_per_epoch is None:
+                raise ValueError(
+                    "Can't build a OneCycleLR without computing steps_per_epoch."
+                )
+            return torch.optim.lr_scheduler.OneCycleLR(
+                optimizer=optimizer,
+                max_lr=lr,
+                epochs=epochs,
+                steps_per_epoch=steps_per_epoch,
+                pct_start=onecycle.pct_start,
+                anneal_strategy=onecycle.anneal_strategy.value,
+                div_factor=onecycle.div_factor,
+                final_div_factor=onecycle.final_div_factor,
+            )
+        case _:
+            raise NotImplementedError("Unknown scheduler config")
 
 
 def run_training(cfg: modular_htr.config.Train) -> None:
@@ -334,26 +334,27 @@ def main():
             tyro.conf.SuppressFixed,
         ),
     )
-    if isinstance(cfg, modular_htr.config.Train):
-        run_training(cfg)
-    elif isinstance(cfg, modular_htr.config.Finetune):
-        run_finetune(cfg)
-    elif isinstance(cfg, modular_htr.config.Evaluate):
-        run_evaluate(cfg)
-    elif isinstance(cfg, modular_htr.config.CompileDataset):
-        run_ds_compile(cfg)
-    elif isinstance(cfg, modular_htr.config.AnalyseDataset):
-        run_analysis(cfg)
-    elif isinstance(cfg, modular_htr.config.BuildLM):
-        from modular_htr.lm.build import run_build_lm
+    match cfg:
+        case modular_htr.config.Train():
+            run_training(cfg)
+        case modular_htr.config.Finetune():
+            run_finetune(cfg)
+        case modular_htr.config.Evaluate():
+            run_evaluate(cfg)
+        case modular_htr.config.CompileDataset():
+            run_ds_compile(cfg)
+        case modular_htr.config.AnalyseDataset():
+            run_analysis(cfg)
+        case modular_htr.config.BuildLM():
+            from modular_htr.lm.build import run_build_lm
 
-        run_build_lm(cfg)
-    elif isinstance(cfg, modular_htr.config.InterpolateLM):
-        from modular_htr.lm.build import run_interpolate_lm
+            run_build_lm(cfg)
+        case modular_htr.config.InterpolateLM():
+            from modular_htr.lm.build import run_interpolate_lm
 
-        run_interpolate_lm(cfg)
-    else:
-        raise NotImplementedError
+            run_interpolate_lm(cfg)
+        case _:
+            raise NotImplementedError
 
 
 if __name__ == "__main__":
