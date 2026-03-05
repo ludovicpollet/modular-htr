@@ -16,6 +16,8 @@ from modular_htr.data.transforms import GPUAugmentation
 from modular_htr.model.HTRModel import HTRModel
 from modular_htr.types import Augmentation, CTCDecoderMode, DebugMode
 
+from modular_htr.logging_config import log_memory_usage
+
 from .ctc import CTCLossWrapper, beam_ctc_decode, build_beam_decoder, greedy_ctc_decode
 from .metrics import cer, wer
 from .utils import CheckpointManager, ScalarMeter, format_metrics, linear_scale
@@ -372,13 +374,18 @@ class Trainer:
             if on_epoch_start:
                 on_epoch_start(epoch, self.model)
 
+            log_memory_usage(logger, f"Epoch {epoch} | before training")
             train_metrics, debug_records = self.train_one_epoch(epoch, train_loader)
+            log_memory_usage(logger, f"Epoch {epoch} | after training")
 
             compute_error_rates = (
                 self.cfg.checkpoint.compute_error_rates
                 and epoch % self.cfg.checkpoint.full_eval_interval == 0
             )
+            logger.info("Starting evaluation for epoch %d", epoch)
+            log_memory_usage(logger, f"Epoch {epoch} | before evaluation")
             val_metrics = self.evaluate(val_loader, compute_error_rates)
+            log_memory_usage(logger, f"Epoch {epoch} | after evaluation")
             logger.info(
                 format_metrics(epoch, train_metrics, val_metrics, self.optimizer)
             )

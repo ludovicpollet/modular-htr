@@ -21,7 +21,7 @@ Here are the basic starting points :
 
 While still a work in progress, this project draws on several key findings from HTR research:
 
-- [Retsinas et al. (2022)](#references) showed that a simple resnet + lstm + ctc architecture with a careful implementation is already a very good starting point that can be further enhanced by other techniques. I implemented a scheduled variant of the shortcut CTC head, a somewhat similar residual backbone, and options to use the max pool height collapse (with inverted images) recommended in the paper. The main difference is that I used variable width batches.
+- [Retsinas et al. (2022)](#references) showed that a simple resnet + lstm + ctc architecture with a careful implementation is already a very good starting point that can be further enhanced by other techniques. I implemented a scheduled variant of the shortcut CTC head, a somewhat similar residual backbone, and options to use the max pool height collapse (with inverted images) recommended in the paper. The main difference is that I used variable width batches (fixed width is now also an option).
 - [Diaz et al. (2021)](#references) makes a compelling argument for the value of CTC based decoders when coupled with simple language models, while demonstrating that a self-attention encoder can replace the lstm while being parameter-efficient, without the need for a full transformer encoder-decoder architecture. I implemented a self-attention encoder with n-gram assisted CTC decoding, but with a much simpler n-gram building technique. They use also a different backbone, and I'm not sure exactly now much my implementation differs since the paper doesn't provide all the details. 
 - [The ConvNeXt (Liu et al.)](#references) paper has also shown that a convolutional feature encoder, when using modern advances and training techniques can scale successfuly and outperform both the ViT and SWIN transformer on classification tasks, especially when one is concerned about efficiency. I'm using two variants, adapted to be suitable for HTR with CTC constraints.
 
@@ -87,6 +87,8 @@ uv run modular-htr model:modular model.backbone:modular --help
 At the moment, the model that performs best for most of **my** use cases uses a residual backbone such as the one proposed by [Retsinas et al.](#references), combined with a multi-head self-attention (with relative sinusoidal positional bias) sequence encoder, and CTC decoding with an optional simple n-gram language model like suggested by [Diaz et al.](#references)
 
 Swapping the resnet-like backbone with an adapted ConvNeXt variant yields promising results, and if compute resources are large enough, the nearly original ConvNeXt-tiny backbone (with adapted downsampling layers) can also be used. This last variant will load Imagenet pretrained weights instead of the standard initialization.
+
+>ConvNeXt backbones do not like variable width batches. Set `--data.fixed-width = True`. This will also enable compilation of the backbone.
 
 For smaller datasets without a complex pretraining strategy, I would advise using the default Retsinas configuration with the CTC shortcut and the LSTM sequence encoder.
 ```bash

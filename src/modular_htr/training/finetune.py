@@ -211,7 +211,10 @@ def restore_model_from_checkpoint(
     model_cfg.pop("model_type", None)
     model = HTRModel.from_config(model_cfg, num_classes=num_classes)
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # Strip torch.compile "_orig_mod." prefix for compatibility
+    raw_sd = checkpoint["model_state_dict"]
+    clean_sd = {k.replace("._orig_mod.", "."): v for k, v in raw_sd.items()}
+    model.load_state_dict(clean_sd)
     model.to(device)
     model.eval()
     return model, tokenizer

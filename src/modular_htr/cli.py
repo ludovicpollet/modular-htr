@@ -11,7 +11,7 @@ from modular_htr.data.analysis import run_analysis
 from modular_htr.data.dataloaders import make_dataloaders
 from modular_htr.data.hf_dataset import build_hf_dataset
 from modular_htr.data.tokenization import apply_ctc_tokenizer, build_char_tokenizer
-from modular_htr.logging_config import add_file_handler, setup_logging
+from modular_htr.logging_config import add_file_handler, log_memory_usage, setup_logging
 from modular_htr.model.HTRModel import HTRModel
 from modular_htr.training.ctc import CTCLossWrapper
 from modular_htr.training.evaluate import run_evaluate
@@ -140,10 +140,11 @@ def run_training(cfg: modular_htr.config.Train) -> None:
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         use_bucketing=cfg.data.use_bucketing,
-        bin_bucket_widths=True,
+        bin_bucket_widths=False,
         pin_memory=device.type != "cpu",
         augmentation=cfg.data.augmentation,
         invert_image=cfg.data.invert_image,
+        fixed_width=cfg.data.fixed_width,
     )
 
     model = build_model(cfg.model, num_classes=len(tokenizer))
@@ -158,8 +159,14 @@ def run_training(cfg: modular_htr.config.Train) -> None:
     if cfg.trainer.channels_last:
         model = model.to(memory_format=torch.channels_last)  # type: ignore
 
-    # compile is unpractical due to the variable width batches, even with dynamic=True
-    # model.backbone = torch.compile(model.backbone, dynamic=True)
+    # torch.compile is auto-enabled for the backbone in fixed-width mode (see below).
+    if cfg.data.fixed_width is not None:
+        model.backbone = torch.compile(model.backbone)  # type: ignore[assignment]
+        logger.info("Fixed-width mode: compiled backbone with torch.compile.")
+        if cfg.trainer.torch_benchmark:
+            logger.warning(
+                "cudNN benchmark can cause issues with torch.compile. Disable if training slows down a regular intervals."
+            )
 
     epochs = cfg.trainer.epochs
     loss_fn = CTCLossWrapper(blank=tokenizer.blank_index)
@@ -173,6 +180,7 @@ def run_training(cfg: modular_htr.config.Train) -> None:
 
     run_dir = create_run_dir(cfg.base_dir, cfg.run_name)
     add_file_handler(run_dir / "train.log")
+    log_memory_usage(logger, "After dataset loading")
     with open(f"{run_dir}/model_summary.txt", "w") as f:
         f.write(str(model_summary))
     dump_config(run_dir, cfg)
@@ -225,6 +233,14 @@ def run_finetune(cfg: modular_htr.config.Finetune) -> None:
     if cfg.trainer.channels_last:
         model = model.to(memory_format=torch.channels_last)  # type: ignore
 
+    if cfg.data.fixed_width is not None:
+        model.backbone = torch.compile(model.backbone)  # type: ignore[assignment]
+        logger.info("Fixed-width mode: compiled backbone with torch.compile.")
+        if cfg.trainer.torch_benchmark:
+            logger.warning(
+                "cudNN benchmark can cause issues with torch.compile. Disable if training slows down a regular intervals."
+            )
+
     tokenizer = merged_tokenizer
     # Allow CLI override of strip_space_before_punctuation (default: inherit from checkpoint).
     if cfg.data.strip_space_before_punctuation:
@@ -250,6 +266,7 @@ def run_finetune(cfg: modular_htr.config.Finetune) -> None:
         use_bucketing=cfg.data.use_bucketing,
         pin_memory=device.type != "cpu",
         invert_image=cfg.data.invert_image,
+        fixed_width=cfg.data.fixed_width,
     )
 
     epochs = cfg.trainer.epochs
@@ -264,6 +281,7 @@ def run_finetune(cfg: modular_htr.config.Finetune) -> None:
 
     run_dir = create_run_dir(cfg.base_dir, cfg.run_name)
     add_file_handler(run_dir / "train.log")
+    log_memory_usage(logger, "After dataset loading")
     dump_config(run_dir, cfg)
 
     checkpoint_manager = CheckpointManager(

@@ -51,11 +51,24 @@ def resize_keep_aspect(pil_img: PIL.Image.Image, fixed_height: int) -> PIL.Image
     return pil_img.resize((new_w, new_h), resample=PIL.Image.Resampling.HAMMING)
 
 
+def resize_to_fit(
+    pil_img: PIL.Image.Image,
+    fixed_height: int,
+    max_width: int,
+) -> PIL.Image.Image:
+    """Resize to fixed height preserving aspect ratio, then scale down if wider than max_width."""
+    img = resize_keep_aspect(pil_img, fixed_height)
+    if img.size[0] > max_width:
+        img = img.resize((max_width, fixed_height), resample=PIL.Image.Resampling.HAMMING)
+    return img
+
+
 def make_preprocessing_fn(
     fixed_height: int,
     tokenizer: CharTokenizer,
     text_col: str = "text",
     image_col: str = "image",
+    fixed_width: int | None = None,
 ) -> Callable:
     """
     One-time preprocessing pipeline to avoid repeated maps. Cached by HuggingFace datasets.
@@ -71,7 +84,10 @@ def make_preprocessing_fn(
         if img.mode != "L":
             img = img.convert("L")
         # resize
-        img = resize_keep_aspect(img, fixed_height)
+        if fixed_width is not None:
+            img = resize_to_fit(img, fixed_height, fixed_width)
+        else:
+            img = resize_keep_aspect(img, fixed_height)
 
         # normalize text to match the tokenizer's alphabet, then tokenize
         text = normalize_text(
@@ -92,40 +108,49 @@ def make_preprocessing_fn(
     return _preprocess
 
 
-def make_runtime_transform(augment: bool = False, invert: bool = False) -> Callable:
-    """
-    Returns the training transforms: to_tensor, and optionally the lighter augmentations that can run on CPU.
-    The caller must not set augment=True if the GPU augmentation pipeline is in use.
-    If invert is True, pixel values are flipped (1.0 - t) so strokes become bright and background dark.
-    """
-    aug = None
-    if augment:
-        aug = v2.Compose(
-            [
-                v2.RandomAffine(
-                    degrees=(-5.0, 5.0),
-                    translate=(0.02, 0.02),
-                    scale=(0.95, 1.05),
-                    shear=(-3, 3),
-                ),
-                # Elastic is too slow on CPU
-                # v2.RandomApply([v2.ElasticTransform(alpha=50.0, sigma=5.0)], p=0.4),
-                v2.RandomPerspective(distortion_scale=0.1, p=0.2),
-                v2.RandomApply([v2.GaussianBlur(kernel_size=3)], p=0.3),
-                v2.ColorJitter(brightness=0.2, contrast=0.2),
-            ]
-        )
+class RuntimeTransform:
+    """Per-batch transform applied by HF ``with_transform()``.
 
-    def _transform(batch):
+    Converts PIL images to tensors, with optional CPU augmentation and
+    pixel inversion.  Picklable, so it works with forkserver/spawn workers.
+    """
+
+    def __init__(self, augment: bool = False, invert: bool = False):
+        self.invert = invert
+        self.aug: v2.Compose | None = None
+        if augment:
+            self.aug = v2.Compose(
+                [
+                    v2.RandomAffine(
+                        degrees=(-5.0, 5.0),
+                        translate=(0.02, 0.02),
+                        scale=(0.95, 1.05),
+                        shear=(-3, 3),
+                    ),
+                    v2.RandomPerspective(distortion_scale=0.1, p=0.2),
+                    v2.RandomApply([v2.GaussianBlur(kernel_size=3)], p=0.3),
+                    v2.ColorJitter(brightness=0.2, contrast=0.2),
+                ]
+            )
+
+    def __call__(self, batch):
         images = []
         for img in batch["image"]:
-            if aug is not None:
-                img = aug(img)
+            if self.aug is not None:
+                img = self.aug(img)
             t = to_tensor(img)
-            if invert:
+            if self.invert:
                 t = 1.0 - t
             images.append(t)
         batch["image"] = images
         return batch
 
-    return _transform
+
+def make_runtime_transform(augment: bool = False, invert: bool = False) -> RuntimeTransform:
+    """Return a picklable per-batch transform (to_tensor + optional augmentation/inversion).
+
+    The caller must not set augment=True if the GPU augmentation pipeline is in use.
+    If invert is True, pixel values are flipped (1.0 - t) so strokes become bright
+    and background dark.
+    """
+    return RuntimeTransform(augment=augment, invert=invert)
