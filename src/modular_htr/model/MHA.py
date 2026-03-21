@@ -1,3 +1,28 @@
+"""
+Relative-bias self-attention stack for htr.
+
+Diaz et al. (2021) showed that this architecture could outperform BiLSTM+CTC 
+and "Transformer-like" seq2seq models while being somewhat parameter efficient. 
+Since I could not find a detailed implementation of their model, I'm not exactly
+sure how this might differ from their work.
+
+The core attention operation is from the well-known Vaswani et al. (2017) paper,
+and the reference, annotated implementation from the Harvard NLP "Annotated Transformer",
+which helped me understand how to tie it together in PyTorch (Rush, 2018).
+
+The sinusoidal relative positional encoding also draws from Shaw et al. (2018),
+Dai et al. (2019) and Raffel et al. (2020). I tried to find a middle ground that I was
+able to implement.
+
+Key decisions are noted inline in this file.
+
+Personal note: this is probably where I am the most out of my depth in this project,
+so kindly remember that the errors and inefficiencies are mine, while the good ideas are 
+from the referenced papers and their implementations.
+
+I would also like to reference the very helpful tutorials from the UvA Deep Learning course
+at https://uvadlc-notebooks.readthedocs.io.
+"""
 import math
 
 import torch
@@ -7,13 +32,17 @@ import torch.nn.functional as F
 
 def sinusoidal_rel_features(rel: torch.Tensor, dim: int) -> torch.Tensor:
     """
-    rel: [...], integer relative distances (e.g. j-i), can be negative.
-    returns: [..., dim] sinusoidal features
+    Computes sinusoidal features for integer relative distances.
+    This is the same distribution as Vaswani et al. (2017), but applied to
+    relative distances (j-i) instead of absolute positions. The relative distance 
+    idea is from Shaw et al. (2018).
     """
     device = rel.device
     half = dim // 2
 
     rel = rel.to(torch.float32).unsqueeze(-1)  # [..., 1]
+
+    # The math here is from Vaswani et al. (same frequency distribution)
     div = torch.exp(
         torch.arange(half, device=device, dtype=torch.float32)
         * (-math.log(10000.0) / half)
@@ -21,7 +50,7 @@ def sinusoidal_rel_features(rel: torch.Tensor, dim: int) -> torch.Tensor:
 
     angles = rel * div  # [..., half]
     feat = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # [..., 2*half]
-    if dim % 2 == 1:
+    if dim % 2 == 1: # pad to dim when odd
         feat = torch.nn.functional.pad(feat, (0, 1))
     return feat  # [..., dim]
 
@@ -30,6 +59,16 @@ class RelSinusoidalPositionBias(nn.Module):
     """
     Bias-only relative positional encoding using sinusoidal features.
     Produces bias [1, H, T, T] to add to attention logits.
+    This is an attempt to combine ideas from multiple publications.
+    I mostly aimed for ease of implementation without going through thorough testing.
+    The relative distance is from Shaw et al., but they inject it to key/value vectors.
+    Using the sinusoïds as a basis for the relative distances was introduced
+    by Dai et al. with "Transformer-XL" (2019), and injecting it as a bias on the
+    logits is closer to what Raffel et al. (2020) did in T5.
+
+    The key difference with most implementations is variable-length support 
+    (I make the hypothesis that it is more important for HTR on medieval documents than
+    for the other intended applications of these architectures), which has a cost.
     """
 
     def __init__(self, num_heads: int, max_rel: int = 256, rel_dim: int = 32):
@@ -40,6 +79,10 @@ class RelSinusoidalPositionBias(nn.Module):
         self.proj = nn.Linear(rel_dim, num_heads, bias=False)
 
     def forward(self, T: int, device=None) -> torch.Tensor:
+        """
+        This builds the [1, H, T, T] bias matrix for a sequence of length T, which
+        means that the bias needs to be recomputed from scratch each call.
+        """
         i = torch.arange(T, device=device)[:, None]
         j = torch.arange(T, device=device)[None, :]
         rel = (j - i).clamp(-self.max_rel, self.max_rel)  # [T,T]
@@ -75,8 +118,9 @@ class MHAWithRelSinBias(nn.Module):
         self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
-        x: [B,T,D]
-        key_padding_mask: [B,T] (True=PAD)
+        x: [B,T,D] input sequence
+        key_padding_mask: [B,T] boolean mask; True marks padding positions
+        that should be ignored in attention.
         """
         B, T, D = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
@@ -104,6 +148,11 @@ class MHAWithRelSinBias(nn.Module):
 class RelBiasEncoderLayer(nn.Module):
     """
     Mirrors nn.TransformerEncoderLayer with norm_first=True and GELU FFN.
+    This is to be consistent with the standard PyTorch implementation.
+    Pre-norm and GELU activation are also the de-facto standard in modern LLMs,
+    and I make use of those techniques without specific testing for my own application.
+
+    I used UvA Deep Learning tutorial 6 for reference here.
     """
 
     def __init__(

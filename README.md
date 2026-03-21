@@ -34,9 +34,10 @@ To get an idea of the perfmorance, this is an early evaluation of the residual b
 
 |Dataset |val CER %| val WER %| test CER %| test WER %| 
 |-------:|:-------:|:--------:|:---------:|:---------:|
-|[IAM (line)](https://huggingface.co/datasets/Teklia/IAM-line)   |1.75|7.61 |2.63|10.02| 
-|[TRIDIS](https://huggingface.co/datasets/magistermilitum/Tridis)|5.42|18.36|6.37|22.81| 
-|[CATMuS modern](https://huggingface.co/datasets/CATMuS/modern)  |3.52|12.04|7.52|23.29|
+|[IAM (line)](https://huggingface.co/datasets/Teklia/IAM-line)     |1.75|7.61 |2.63|10.02| 
+|[TRIDIS](https://huggingface.co/datasets/magistermilitum/Tridis)  |5.42|18.36|6.37|22.81| 
+|[CATMuS modern](https://huggingface.co/datasets/CATMuS/modern)    |3.52|12.04|7.52|23.29|
+|[CATMuS medieval](https://huggingface.co/datasets/CATMuS/medieval)|3.37|14.17|6.83|30.52|
 
 Note that errors on the tridis dataset are mostly commas: in most cases, the model is probably right that they do not exist (ground truth punctuation is modernised). 
 
@@ -267,10 +268,14 @@ These parameters should be tuned on the validation set.
 
 - Puigcerver J., "Are Multidimensional Recurrent Layers Really Necessary for Handwritten Text Recognition?", *ICDAR*, 2017, DOI: [10.1109/ICDAR.2017.20](https://doi.org/10.1109/ICDAR.2017.20).
 - Hannun A., "Sequence Modeling with CTC", Distill, 2017, DOI: [10.23915/distill.00008](https://doi.org/10.23915/distill.00008).
-- Diaz, D. H. et al., "Rethinking Text Line Recognition Models", *CVPR*, 2021, DOI: [10.48550/arXiv.2104.07787](https://doi.org/10.48550/arXiv.2104.07787).
+- Diaz D. H. et al., "Rethinking Text Line Recognition Models", *CVPR*, 2021, DOI: [10.48550/arXiv.2104.07787](https://doi.org/10.48550/arXiv.2104.07787).
 - Retsinas G. et al., "Best Practices for a Handwritten Text Recognition System", *Document Analysis and Recognition [DAS]*, 2022, DOI: [10.1007/978-3-031-06555-2_17](https://doi.org/10.1007/978-3-031-06555-2_17).
+- Vaswani et al., "Attention Is All You Need, *NIPS*, 2017, DOI: [10.48550/arXiv.1706.03762](https://doi.org/10.48550/arXiv.1706.03762)
+- Shaw P. et al., "Self-Attention with Relative Position Representation", *ACL*, 2018, DOI: [10.48550/arXiv.1803.02155](https://doi.org/10.48550/arXiv.1803.02155)
+- Dai Z. et al., "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context", *ACL*, 2019, DOI: [10.48550/arXiv.1901.02860](https://doi.org/10.48550/arXiv.1901.02860)
+- Raffel C. et al., "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer", *JMLR*, 2020, DOI: [10.48550/arXiv.1910.10683](https://doi.org/10.48550/arXiv.1910.10683)
 - Liu Z. et al., "A ConvNet for the 2020s", *CVPR*, 2022, DOI, [10.1109/CVPR52688.2022.01167](https://doi.org/10.1109/CVPR52688.2022.01167).
-- Tarride S. et al. "Improving Automatic Text Recognition with  Language Models in the PyLaia Open-Source Library", 2024, DOI: [10.48550/arXiv.2404.18722](https://doi.org/10.48550/arXiv.2404.18722).
+- Tarride S. et al., "Improving Automatic Text Recognition with  Language Models in the PyLaia Open-Source Library", 2024, DOI: [10.48550/arXiv.2404.18722](https://doi.org/10.48550/arXiv.2404.18722).
 - Torres Aguilar S., "TRIDIS: A Comprehensive Medieval and Early
 Modern Corpus for HTR and NER", 2025, DOI: [10.48550/arXiv.2503.22714](https://doi.org/10.48550/arXiv.2503.22714).
 - Clérice T. et al., "CATMuS Medieval: A multilingual large-scale cross-century dataset in Latin script for handwritten text recognition and beyond", *ICDAR*, 2024, DOI: [10.1007/978-3-031-70543-4_11](https://dx.doi.org/10.1007/978-3-031-70543-4_11).
